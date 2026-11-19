@@ -17190,8 +17190,6 @@ do
 									task.wait()
 								until game:IsLoaded()
 
-								copyright = "Copyright (c) 2026 Project Resonance. All rights reserved."
-
 								StarterGui = game:GetService("StarterGui")
 
 								fn17 = function(arg, arg2, arg3)
@@ -18177,7 +18175,6 @@ do
 							table.insert(tbl7.TeleportLocations, part3)
 							tbl12 = {}
 
-							copyright = "Copyright (c) 2026 Project Resonance. All rights reserved."
 
 							tbl12.NotifyEvent = function(arg, arg2, arg3)
 								local notificationSettings = tbl7.NotificationSettings
@@ -18871,6 +18868,52 @@ do
 							return (arg.Position - arg2.Position).Magnitude
 						end
 
+						-- PING GOVERNOR: a shared ping level (0 normal, 1 elevated, 2 high) read from Data Ping, with a learned
+						-- baseline (the lowest ping seen, creeping up 1% a sample so a worse connection is accepted over time)
+						-- and hysteresis so it doesn't flicker. The kick and Anti Grab both slow their own remotes down by it,
+						-- instead of firing at a fixed rate no matter how the connection is doing.
+						tbl7.PingGov = tbl7.PingGov or { at = 0, ms = 0, base = nil, level = 0 }
+
+						tbl12.PingLevel = function()
+							local gov = tbl7.PingGov
+							local now3 = os.clock()
+
+							if now3 - gov.at >= 0.25 then
+								gov.at = now3
+								local ok, ms = pcall(function()
+									return Stats2.Network.ServerStatsItem["Data Ping"]:GetValue()
+								end)
+
+								if ok and type(ms) == "number" then
+									gov.ms = ms
+
+									if not gov.base or ms < gov.base then
+										gov.base = ms
+									else
+										gov.base = gov.base + (ms - gov.base) * 0.01
+									end
+
+									local rise = ms - gov.base
+
+									if ms >= 220 or rise >= 110 then
+										gov.level = 2
+									elseif ms >= 130 or rise >= 55 then
+										if gov.level == 2 and (ms >= 176 or rise >= 80) then
+											gov.level = 2
+										else
+											gov.level = 1
+										end
+									elseif ms >= 110 or rise >= 35 then
+										gov.level = math.min(gov.level, 1)
+									else
+										gov.level = 0
+									end
+								end
+							end
+
+							return gov.level
+						end
+
 						tbl12.GetClosestPlayer = function(arg)
 							local huge = math.huge
 							local v24 = nil
@@ -19242,6 +19285,11 @@ do
 							flag12 = true
 						end
 
+						-- WELD + DESYNC CAMERA (the original RSCClient trick): the weld is a direct CFrame glide to cframe3
+						-- every Heartbeat with velocity zeroed; the desync camera is a RenderStep bind (just before the camera
+						-- reads) that puts our body + head back where they were, so the glide is never seen. cframe/cframe2
+						-- always hold the real "home" position, and we snap back to it on release.
+
 						local flag13 = arg.Name == "HumanoidRootPart" or arg.Name == "Torso"
 						local v27 = nil
 
@@ -19273,6 +19321,7 @@ do
 							cframe2 = v25.CFrame
 							cframe = head.CFrame
 							cframe3 = v25.CFrame
+							pcall(tbl12.ToggleCollisions, v24, false)
 
 							RunService:BindToRenderStep("RSCClient", Enum.RenderPriority.Camera.Value - 1, function()
 								v25.CFrame = cframe2
@@ -19284,19 +19333,25 @@ do
 								cframe = head.CFrame
 								v25.CFrame = cframe3
 								head.CFrame = cframe3
+								v25.AssemblyLinearVelocity = Vector3.zero
+								v25.AssemblyAngularVelocity = Vector3.zero
 							end)
 						end
 
 						local function fn22()
-							RunService:UnbindFromRenderStep("RSCClient")
+							pcall(function()
+								RunService:UnbindFromRenderStep("RSCClient")
+							end)
 
 							if connection then
 								connection:Disconnect()
 								connection = nil
 							end
 
+							pcall(tbl12.ToggleCollisions, v24, true)
 							head.CFrame = cframe
 							v25.CFrame = cframe2
+							tbl12.ReturnPCLD()
 						end
 
 						local ok, result = pcall(function()
@@ -19306,6 +19361,7 @@ do
 
 							arg2 = arg2 or 0.65
 							local now3 = tick()
+							local lastChaseGrab = 0
 
 							while not flag11 and arg.Parent and not tbl12.IsPartOwner(arg) and v26.Health ~= 0 and v25.Parent and (not arg3 or arg3()) and tick() - now3 < arg2 do
 								if flag12 then
@@ -19322,7 +19378,24 @@ do
 									v28 = nil
 								end
 
-								grab(arg, v28)
+								-- SAME TIMING AS EVERYWHERE ELSE: this used to burst 2 SetNetworkOwners every single
+								-- frame uncapped, which spiked ping on its own since every other chase/claim path in
+								-- the script is rate-limited. Match the generic Kick's own far-chase cadence instead.
+								local chaseBase = (tbl9.NKDelayMode == "Faster but worse") and 0.0049 or 0.0079
+								local chasePingLv = tbl12.PingLevel()
+
+								if chasePingLv >= 2 then
+									chaseBase *= 2.2
+								elseif chasePingLv == 1 then
+									chaseBase *= 1.4
+								end
+
+								local now4 = os.clock()
+
+								if now4 - lastChaseGrab >= chaseBase then
+									lastChaseGrab = now4
+									grab(arg, v28)
+								end
 							end
 						end)
 
@@ -21052,9 +21125,47 @@ end
 						n36 = os.clock() + 0.14
 					end
 
+					-- Hands our own PCLD (PhysicsRepRootPart + sleeping flag) back to normal after anything that teleports us.
+					-- Skipped while Position Desync is on, since that feature runs its own claim/release cycle.
+					tbl12.ReturnPCLD = function()
+						local function once()
+							if flag11 or tbl8.Desync or type(sethiddenproperty) ~= "function" then
+								return
+							end
+							local _, root = tbl12.Char()
+							if root and root.Parent then
+								pcall(sethiddenproperty, root, "PhysicsRepRootPart", nil)
+								pcall(sethiddenproperty, root, "NetworkIsSleeping", false)
+							end
+						end
+						once()
+						task.delay(0.1, once)
+						task.delay(0.35, once)
+					end
+
+					task.spawn(function()
+						local wasOwning = false
+						while true do
+							RunService.Heartbeat:Wait()
+							if flag11 then
+								return
+							end
+							local owning = tbl7.States.Owning == true
+							if wasOwning and not owning then
+								tbl12.ReturnPCLD()
+							end
+							wasOwning = owning
+						end
+					end)
+
 					tbl12.SetDesync = function(arg)
 						local desync = arg == true and not flag11 and tbl12.DesyncSupported == true
-						if tbl8.Desync == desync then
+
+						-- ALWAYS force a fresh (re)connect when turning desync ON, even if tbl8.Desync already
+						-- says true - that flag can go stale if the underlying connection died silently (a
+						-- flipped fflag, a missed getfflag/setfflag call), which is exactly why "sometimes it
+						-- doesn't use the desync camera" even though SetDesync(true) is called every time.
+						if tbl8.Desync == desync and not desync then
 							return
 						end
 						tbl12.SetRuntimeConnection("Desync", nil, false)
@@ -21083,6 +21194,86 @@ end
 						end
 
 						tbl12.SetRuntimeConnection("Desync", RunService.Heartbeat, desync, tbl12.UpdateDesync)
+					end
+
+					-- DESYNC PCLD (keybind): uses EKI on the target - claims network ownership of his root (tbl12.SNO),
+					-- then sets his root's PhysicsRepRootPart to itself (sethiddenproperty), which desyncs his PCLD. Works on
+					-- the selected players, or on whoever the mouse is over if nobody is selected. Press again to give
+					-- his PCLD back (also released automatically if he dies/leaves or we lose him for a while).
+					tbl7.PCLDDesynced = tbl7.PCLDDesynced or {}
+
+					tbl12.DesyncPCLD = function()
+						if type(sethiddenproperty) ~= "function" then
+							return fn18("Your executor can't set PhysicsRepRootPart", "Desync PCLD")
+						end
+						local targets = {}
+
+						for player in pairs(tbl7.SelectedPlayers) do
+							if player and player.Parent and player ~= localPlayer then
+								table.insert(targets, player)
+							end
+						end
+
+						if #targets == 0 then
+							local hit = localPlayer:GetMouse().Target
+							local player = hit and Players:GetPlayerFromCharacter(hit:FindFirstAncestorOfClass("Model"))
+
+							if player and player ~= localPlayer then
+								targets[1] = player
+							end
+						end
+
+						if #targets == 0 then
+							return fn18("Select a player (or point at one) first", "Desync PCLD")
+						end
+
+						for _, player in ipairs(targets) do
+							if tbl7.PCLDDesynced[player] then
+								tbl7.PCLDDesynced[player] = nil -- second press: hand it back (the loop below releases it)
+								fn18("Giving " .. player.Name .. "'s PCLD back", "Desync PCLD")
+							else
+								local token = {}
+								tbl7.PCLDDesynced[player] = token
+								fn18("Desyncing " .. player.Name .. "'s PCLD", "Desync PCLD")
+
+								task.spawn(function()
+									local lostAt = nil
+									local lastRoot = nil
+
+									while not flag11 and tbl7.PCLDDesynced[player] == token and player.Parent do
+										local _, root, humanoid = tbl12.Char(player)
+
+										if not (root and root.Parent and humanoid and humanoid.Health > 0) then
+											break
+										end
+										lastRoot = root
+
+										if not tbl12.IsNetworkOwner(root) then
+											lostAt = lostAt or os.clock()
+											pcall(tbl12.SNO, root) -- claim him first (EKI needs us to be his owner)
+
+											if os.clock() - lostAt > 8 then
+												break
+											end
+										else
+											lostAt = nil
+											pcall(sethiddenproperty, root, "PhysicsRepRootPart", root)
+										end
+
+										task.wait(0.1)
+									end
+
+									-- always hand the PCLD back
+									if lastRoot then
+										pcall(sethiddenproperty, lastRoot, "PhysicsRepRootPart", nil)
+									end
+
+									if tbl7.PCLDDesynced[player] == token then
+										tbl7.PCLDDesynced[player] = nil
+									end
+								end)
+							end
+						end
 					end
 				end
 			end
@@ -21225,120 +21416,411 @@ end
 						end
 					end
 
-					tbl12.AntiGrab = function()
-						if flag11 then
-							return
-						end
+						-- =============================================================================================================
+						-- ANTI-GRAB (improved "Normal" + EKI bypass)
+						--   * starts on IsHeld OR a PartOwner of somebody else on any of our parts (see the hook next to the IsHeld signal)
+						--   * Struggle + RagdollRemote every 1/38s (was 1/30s), and the grab line is cut with DestroyGrabLine on every part they own + root / torso / head
+						--   * the pin also zeroes the velocity of every part of ours, not just the root, so the grab line can not slide us
+						--   * ends after 0.12s without a grab (no stop / start flicker), also when we die; RequiresNeck is put back (it was left off)
+						--   * EKI BYPASS (toggle "Anti-Grab: EKI Bypass"): EKI is the kicker's  sethiddenproperty(ourHRP, "PhysicsRepRootPart", ourHRP)  on THEIR client; it can
+						--     not be blocked at the source, so it is answered on ours: (1) our own PhysicsRepRootPart / NetworkIsSleeping are kept clean while we are
+						--     grabbed, (2) our PCLD (the server's copy of our position) is remembered while we are in sync, (3) when the grab ends we run a resync:
+						--     0.6s of tiny position / velocity changes (a resting assembly sends nothing, which is why you had to walk to get back in sync), our
+						--     rep root cleared, and the result is checked against our PCLD: still more than 6 studs apart = a real 3-stud step, up to 3 rounds,
+						--     (4) a watchdog does the same whenever our PCLD stays more than 10 studs from us for 0.75s with no grab and no Desync of our own.
+						-- =============================================================================================================
+						tbl7.AGX = tbl7.AGX or { pcld = nil, resync = false, lastResync = 0, wd = false }
+						
+						tbl12.AGHeld = function()
+							-- "Allow Whitelisted Grabs" (Normal Anti-Grab only): a grab tagged to a whitelisted player's name
+							-- does not count, so the pin never kicks in against them. isHeld alone can't tell WHO is holding
+							-- you, so while this is on we go by the PartOwner name tag instead and skip the plain isHeld check.
+							local wlSkip = tbl8.AllowWhitelistedGrabs and tbl9.AGType == "Normal"
 
-						if isHeld.Value and tbl8.AntiGrab and not tbl7.States["Anti Grab"] then
-							tbl11.Struggle:FireServer()
-							local v23, v24, v25 = tbl12.Char()
-							local torso = v23 and v23:FindFirstChild("Torso")
-							local neck = torso and torso:FindFirstChild("Neck")
-							if not (v25 and torso) then
+							if isHeld.Value and not wlSkip then
+								return true
+							end
+							local character = localPlayer.Character
+						
+							if not character then
+								return false
+							end
+						
+							for _, part in ipairs(character:GetChildren()) do
+								if part:IsA("BasePart") then
+									local partOwner = part:FindFirstChild("PartOwner")
+									local owner = partOwner and partOwner.Value
+						
+									if owner ~= nil and owner ~= "" and owner ~= 0 and owner ~= localPlayer.Name and owner ~= localPlayer then
+										if wlSkip then
+											local grabber = Players:FindFirstChild(tostring(owner))
+
+											if not (grabber and tbl7.Whitelisted[grabber]) then
+												return true
+											end
+										else
+											return true
+										end
+									end
+								end
+							end
+
+							return false
+						end
+						
+						tbl12.AGCutLines = function(character)
+							local destroyGrabLine = tbl11.DestroyGrabLine
+						
+							if not (destroyGrabLine and character) then
 								return
 							end
-							v25.RequiresNeck = false
-							v25.AutoRotate = false
-							tbl12.ResetVelocity(v24 or torso)
-							local position = torso.Position
-							local lookVector = torso.CFrame.LookVector
-							local unit = Vector3.new(lookVector.X, 0, lookVector.Z).Unit
-							tbl7.States["Anti Grab"] = true
-							local flag12 = tbl9.AGType == "Escapes Anything, but buggy"
-							local sit = tbl9.AGType == "Anti-Kill"
-							local flag13 = tbl9.AGType == "No Ragdoll"
+							local seen = {}
+						
+							local function hit(part)
+								if part and part.Parent and not seen[part] then
+									seen[part] = true
+									pcall(destroyGrabLine.FireServer, destroyGrabLine, part)
+								end
+							end
+						
+							for _, part in ipairs(character:GetChildren()) do
+								if part:IsA("BasePart") then
+									local partOwner = part:FindFirstChild("PartOwner")
+									local owner = partOwner and partOwner.Value
+						
+									if owner ~= nil and owner ~= "" and owner ~= 0 and owner ~= localPlayer.Name and owner ~= localPlayer then
+										hit(part)
+									end
+								end
+							end
+						
+							hit(character:FindFirstChild("HumanoidRootPart"))
+							hit(character:FindFirstChild("Torso"))
+							hit(character:FindFirstChild("Head"))
+						end
+						
+						-- our own PCLD: remembered while we are in sync (it is the part the server places from our root, so it is what shows a desync)
+						tbl12.AGFindPCLD = function(maxDistance)
+							local state = tbl7.AGX
+							local cached = state.pcld
+						
+							if cached and cached.Parent and cached.Name == "PlayerCharacterLocationDetector" then
+								return cached
+							end
+						
+							state.pcld = nil
+							local assigned = tbl7.PCLD[localPlayer]
+						
+							if assigned and assigned.Parent then
+								state.pcld = assigned
+								return assigned
+							end
+							local character, root = tbl12.Char()
+						
+							if not root then
+								return nil
+							end
+							local taken = {}
+						
+							for _, part in pairs(tbl7.PCLD) do
+								taken[part] = true
+							end
+						
+							local best = nil
+							local bestDistance = maxDistance or 4
+						
+							for part in pairs(tbl7.PCLDParts) do
+								if part.Parent and not taken[part] and part.Name == "PlayerCharacterLocationDetector" and not tbl12.IsWaitingPCLD(part) then
+									local distance = (part.Position - root.Position).Magnitude
+						
+									if distance < bestDistance then
+										best = part
+										bestDistance = distance
+									end
+								end
+							end
+						
+							state.pcld = best
+							return best
+						end
+						
+						tbl12.AGResync = function(reason)
+							local state = tbl7.AGX
 
-							if flag12 then
-								task.spawn(tbl12.ExtraEscape)
+							if state.resync or flag11 then
+								return
+							end
+							state.resync = true
+
+							-- one sync pulse: our rep root / sleeping cleared, a tiny position + velocity change (a resting assembly sends nothing), every part's velocity zero
+							local function pulse(flip)
+								local character, root, humanoid = tbl12.Char()
+
+								if not (character and root and humanoid and humanoid.Health > 0 and root.Parent) then
+									return false
+								end
+
+								pcall(function()
+									root.Anchored = false
+									humanoid.PlatformStand = false
+
+									if type(sethiddenproperty) == "function" and not tbl8.Desync then
+										sethiddenproperty(root, "PhysicsRepRootPart", nil)
+										sethiddenproperty(root, "NetworkIsSleeping", false)
+									end
+
+									root.CFrame = root.CFrame + Vector3.new(0, flip and 0.04 or -0.04, 0)
+									root.AssemblyAngularVelocity = Vector3.zero
+									root.AssemblyLinearVelocity = Vector3.new(0, flip and 0.4 or 0, 0)
+								end)
+
+								return true
 							end
 
-							local now3 = tick()
-							local connection = nil
-							local n36 = tick() + 0.033333333333333333
-							local n37 = 0
+							local function converged()
+								local character, root = tbl12.Char()
+								local pcld = tbl7.AGX.pcld
 
-							connection = RunService.RenderStepped:Connect(function(deltaTime)
-								local now4 = tick()
+								if not (root and pcld and pcld.Parent) then
+									return nil
+								end
+								return (pcld.Position - root.Position).Magnitude <= 4
+							end
 
-								if now4 >= n36 then
-									tbl11.Struggle:FireServer()
-									n36 = now4 + 0.033333333333333333
+							-- INSTANT: the first pulse goes out in the very frame the grab ended, before anything is scheduled
+							pulse(true)
+
+							task.spawn(function()
+								local attempts = 0
+
+								while attempts < 3 and not flag11 do
+									attempts = attempts + 1
+									local started = os.clock()
+									local flip = false
+
+									while os.clock() - started < 0.35 and not flag11 do
+										if tbl7.States["Anti Grab"] then
+											state.resync = false
+											return
+										end
+										flip = not flip
+
+										if not pulse(flip) then
+											break
+										end
+
+										if converged() then
+											state.resync = false
+											state.lastResync = os.clock()
+											return
+										end
+
+										RunService.Heartbeat:Wait()
+									end
+
+									if converged() ~= false then
+										break
+									end
+
+									-- still apart: a real step (big enough to be replicated), then back
+									pcall(function()
+										local character, root = tbl12.Char()
+										local cframe = root.CFrame
+										root.CFrame = cframe + Vector3.new(0, 3, 0)
+										RunService.Heartbeat:Wait()
+										root.CFrame = cframe
+									end)
 								end
 
-								if v24 and not flag12 and not flag13 and now4 >= n37 then
-									local ragdollRemote = tbl11.RagdollRemote
-									local fireServer = ragdollRemote.FireServer
-									local n38
+								state.resync = false
+								state.lastResync = os.clock()
+							end)
+						end
 
-									if sit then
-										n38 = 0.11
+						tbl12.AGEnsureWatchdog = function()
+							local state = tbl7.AGX
+						
+							if state.wd then
+								return
+							end
+							state.wd = true
+						
+							task.spawn(function()
+								local badSince = nil
+								local stamps = {}
+						
+								while not flag11 do
+									task.wait(0.25)
+						
+									if tbl8.AntiGrab and tbl8.AGEKIBypass ~= false and not tbl7.States["Anti Grab"] and not state.resync and not tbl8.Desync
+										and not tbl7.States.Owning and not tbl7.States.Spawning and not tbl8.GucciAntiGrab and not tbl12.AGHeld() then
+										local character, root, humanoid = tbl12.Char()
+										local pcld = state.pcld
+						
+										if not (pcld and pcld.Parent) then
+											pcld = tbl12.AGFindPCLD(3)
+										end
+						
+										if character and root and humanoid and humanoid.Health > 0 and pcld and pcld.Parent and not tbl12.IsWaitingPCLD(pcld) then
+											local distance = (pcld.Position - root.Position).Magnitude
+						
+											if distance > 10 then
+												badSince = badSince or os.clock()
+						
+												if os.clock() - badSince > 0.75 and os.clock() - state.lastResync > 2 then
+													local now3 = os.clock()
+						
+													for i = #stamps, 1, -1 do
+														if now3 - stamps[i] > 30 then
+															table.remove(stamps, i)
+														end
+													end
+						
+													if #stamps < 6 then
+														stamps[#stamps + 1] = now3
+														tbl12.AGResync("PCLD " .. math.floor(distance) .. " studs from us")
+													end
+						
+													badSince = nil
+												end
+											else
+												badSince = nil
+											end
+										else
+											badSince = nil
+										end
 									else
-										n38 = 0
+										badSince = nil
 									end
+								end
+						
+								state.wd = false
+							end)
+						end
+						
+						tbl12.AntiGrab = function()
+							if flag11 then
+								return
+							end
 
-									fireServer(ragdollRemote, v24, n38)
-									n37 = now4 + 0.033333333333333333
+							tbl12.AGEnsureWatchdog()
+
+							if tbl12.AGHeld() and tbl8.AntiGrab and not tbl7.States["Anti Grab"] then
+								tbl11.Struggle:FireServer()
+								local v23, v24, v25 = tbl12.Char()
+								local torso = v23 and v23:FindFirstChild("Torso")
+								local neck = torso and torso:FindFirstChild("Neck")
+								if not (v25 and torso) then
+									return
+								end
+								local rootPart = v24 or torso
+								local savedNeck = v25.RequiresNeck
+								v25.RequiresNeck = false
+								v25.AutoRotate = false
+								tbl12.ResetVelocity(rootPart)
+								local position = torso.Position
+								local lookVector = torso.CFrame.LookVector
+								local flatLook = Vector3.new(lookVector.X, 0, lookVector.Z)
+								-- looking near-straight up/down flattens to a near-zero vector; .Unit on that is NaN, which
+								-- poisons every CFrame.lookAt below and is what was tilting the pin into a broken angle.
+								-- Fall back to the camera's flattened look direction instead.
+								local unit
+
+								if flatLook.Magnitude > 0.05 then
+									unit = flatLook.Unit
+								else
+									local camLook = currentCamera.CFrame.LookVector
+									local flatCam = Vector3.new(camLook.X, 0, camLook.Z)
+									unit = flatCam.Magnitude > 0.05 and flatCam.Unit or Vector3.new(0, 0, -1)
+								end
+								tbl7.States["Anti Grab"] = true
+								local flag12 = tbl9.AGType == "Escapes Anything, but buggy"
+								local sit = tbl9.AGType == "Anti-Kill"
+								local flag13 = tbl9.AGType == "No Ragdoll"
+								-- EKI bypass is always on (automatic); tbl8.AGEKIBypass = false is only a manual escape hatch
+								local bypass = tbl8.AGEKIBypass ~= false and type(sethiddenproperty) == "function"
+
+								if bypass then
+									tbl12.AGFindPCLD(8)
 								end
 
-								if flag12 and tick() - now3 > 2 then
+								-- taken from another script's anti-grab: the whole rig is pinned rigidly (limb offsets relative to the torso, captured now),
+								-- Dead is disabled while we are held, the Animate script is switched off and every animation stopped
+								local limbOffsets = {}
+								local limbNames = { "Head", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
+								local agStandOffsets = {
+									Head = Vector3.new(0, 1.5, 0),
+									["Left Arm"] = Vector3.new(-1.5, 0, 0),
+									["Right Arm"] = Vector3.new(1.5, 0, 0),
+									["Left Leg"] = Vector3.new(-0.5, -2, 0),
+									["Right Leg"] = Vector3.new(0.5, -2, 0),
+								}
+
+								for _, name in ipairs(limbNames) do
+									local limb = v23:FindFirstChild(name)
+
+									if limb and limb:IsA("BasePart") then
+										-- fixed, perfectly upright R6 layout instead of whatever (possibly already bent/tilted) pose
+										-- the grab left us in - this is what stops the tilt/bend when someone grabs us
+										limbOffsets[name] = CFrame.new(agStandOffsets[name] or Vector3.zero)
+									end
+								end
+
+								local rootOffset = rootPart ~= torso and CFrame.identity or nil
+								local animate = v23:FindFirstChild("Animate")
+								local animateWas = animate and animate.Enabled
+
+								pcall(function()
+									v25:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+
+									if animate then
+										animate.Enabled = false
+									end
+								end)
+
+								if flag12 then
 									task.spawn(tbl12.ExtraEscape)
-									now3 = tick()
 								end
 
-								local moveDirection = v25.MoveDirection
-								local walkSpeed
+								local now3 = tick()
+								local connection = nil
+								local connection2 = nil
+								local n36 = 0
+								local n37 = 0
+								local nBypass = 0
+								local nBypassOwn = 0
+								local nSlow = 0
+								local lostAt = nil
+								local finished = false
 
-								if tbl8.WalkSpeed and tbl9.WalkSpeed > 16 then
-									walkSpeed = tbl9.WalkSpeed
-								else
-									walkSpeed = 16
-								end
+								local function snap()
+									local cf = CFrame.lookAt(position, position + unit)
+									torso.CFrame = cf
 
-								if moveDirection.Magnitude > 0 then
-									position += moveDirection * walkSpeed * deltaTime
-								end
+									if rootOffset then
+										rootPart.CFrame = cf * rootOffset
+									end
 
-								if (currentCamera.CFrame.Position - currentCamera.Focus.Position).Magnitude < 1 then
-									moveDirection = currentCamera.CFrame.LookVector
-								end
+									for name, offset in pairs(limbOffsets) do
+										local limb = v23:FindFirstChild(name)
 
-								local vector = Vector3.new(moveDirection.X, 0, moveDirection.Z)
+										if limb then
+											limb.CFrame = cf * offset
+										end
+									end
 
-								if vector.Magnitude > 0 then
-									unit = unit:Lerp(vector.Unit, math.min(deltaTime * 12, 1)).Unit
-								end
-
-								tbl12.ResetVelocity(v24 or torso)
-
-								if v22 then
-									local v26 = torso
-									local v27 = v22
-									position = v22.Position
-									v26.CFrame = v27
-									v22 = nil
-								else
-									torso.CFrame = CFrame.lookAt(position, position + unit)
-								end
-
-								v25.Sit = sit
-
-								if not neck or not neck.Enabled then
-									tbl12.ToggleCollisions(v23, false)
-									tbl12.RepositionLimbs(v23, true)
-								end
-
-								for _, v26 in ipairs(v25:GetPlayingAnimationTracks()) do
-									if v26.Animation.AnimationId == "rbxassetid://7047322890" then
-										v26:Stop()
+									for _, part in ipairs(v23:GetChildren()) do
+										if part:IsA("BasePart") then
+											tbl12.ResetVelocity(part)
+										end
 									end
 								end
 
-								if v24 and v24:FindFirstChild("Scream") then
-									v24.Scream.Playing = false
-								end
-
-								if not isHeld.Value or not tbl8.AntiGrab then
+								local function finish()
+									if finished then
+										return
+									end
+									finished = true
 									tbl7.States["Anti Grab"] = false
 
 									if sit then
@@ -21350,12 +21832,201 @@ end
 										end)
 									end
 
-									v25.AutoRotate = true
-									connection:Disconnect()
+									pcall(function()
+										v25.AutoRotate = true
+										v25.RequiresNeck = savedNeck
+										v25:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+
+										if animate and animateWas then
+											animate.Enabled = true
+										end
+									end)
+
+									if connection then
+										connection:Disconnect()
+									end
+
+									if connection2 then
+										connection2:Disconnect()
+									end
+
+									if bypass and not flag11 and v25.Health > 0 then
+										tbl12.AGResync("grab ended")
+									end
 								end
-							end)
+
+								-- Heartbeat AND RenderStepped: the pin is written before replication (Heartbeat) and before rendering (RenderStepped);
+								-- only RenderStepped integrates our own movement
+								local function step(deltaTime, render)
+									local now4 = tick()
+
+									-- base rate 1/33s (fewer Struggle/RagdollRemote calls per second than the old 1/38s;
+									-- this was the main source of the ping spike while pinned) - still well above what's needed to hold.
+									if now4 >= n36 then
+										tbl11.Struggle:FireServer()
+										tbl12.AGCutLines(v23)
+										local agGap = 0.030303030303030304
+									local agPingLv = tbl12.PingLevel()
+
+									if agPingLv >= 2 then
+										agGap *= 2.5
+									elseif agPingLv == 1 then
+										agGap *= 1.6
+									end
+
+									n36 = now4 + agGap
+									end
+
+									if rootPart and not flag12 and not flag13 and now4 >= n37 then
+										local ragdollRemote = tbl11.RagdollRemote
+										local fireServer = ragdollRemote.FireServer
+										local n38
+
+										if sit then
+											n38 = 0.11
+										else
+											n38 = 0
+										end
+
+										fireServer(ragdollRemote, rootPart, n38)
+										local agGap2 = 0.030303030303030304
+									local agPingLv2 = tbl12.PingLevel()
+
+									if agPingLv2 >= 2 then
+										agGap2 *= 2.5
+									elseif agPingLv2 == 1 then
+										agGap2 *= 1.6
+									end
+
+									n37 = now4 + agGap2
+									end
+
+									if flag12 and tick() - now3 > 2 then
+										task.spawn(tbl12.ExtraEscape)
+										now3 = tick()
+									end
+
+									if render then
+										local moveDirection = v25.MoveDirection
+										local walkSpeed
+
+										if tbl8.WalkSpeed and tbl9.WalkSpeed > 16 then
+											walkSpeed = tbl9.WalkSpeed
+										else
+											walkSpeed = 16
+										end
+
+										if moveDirection.Magnitude > 0 then
+											position += moveDirection * walkSpeed * deltaTime
+										end
+
+										if (currentCamera.CFrame.Position - currentCamera.Focus.Position).Magnitude < 1 then
+											moveDirection = currentCamera.CFrame.LookVector
+										end
+
+										local vector = Vector3.new(moveDirection.X, 0, moveDirection.Z)
+
+										if vector.Magnitude > 0 then
+											unit = unit:Lerp(vector.Unit, math.min(deltaTime * 12, 1)).Unit
+										end
+									end
+
+									if v22 then
+										position = v22.Position
+										v22 = nil
+									end
+
+									snap()
+									v25.Sit = sit
+
+									-- NO ANIMATIONS / NO RAGDOLL while held: every frame, not on the slow tick
+									for _, track in ipairs(v25:GetPlayingAnimationTracks()) do
+										pcall(track.Stop, track, 0)
+									end
+
+									local agRagdolled = v25:FindFirstChild("Ragdolled")
+
+									if agRagdolled and agRagdolled.Value then
+										pcall(function()
+											agRagdolled.Value = false
+										end)
+									end
+
+									if bypass and not tbl8.Desync and now4 >= nBypass then
+										nBypass = now4 + 0.05
+										pcall(sethiddenproperty, rootPart, "PhysicsRepRootPart", nil)
+										pcall(sethiddenproperty, rootPart, "NetworkIsSleeping", false)
+									end
+
+									-- the hidden-property clear above is purely local/cosmetic: the kicker's EKI keeps re-asserting
+									-- real network ownership of our root via SetNetworkOwner, which clearing our own properties
+									-- never touches. This is the part that actually fights back - reclaiming ownership of our own
+									-- root the same way the kicker claims it - which is what "EKI Bypass" was missing. Throttled well
+									-- below the Struggle/RagdollRemote rate above (and backed off further under the ping governor)
+									-- so it doesn't add to the remote spam.
+									if bypass and now4 >= nBypassOwn then
+										local bypassGap = 0.12
+										local bypassPingLv = tbl12.PingLevel()
+
+										if bypassPingLv >= 2 then
+											bypassGap = 0.3
+										elseif bypassPingLv == 1 then
+											bypassGap = 0.2
+										end
+
+										nBypassOwn = now4 + bypassGap
+
+										if not tbl12.IsNetworkOwner(rootPart) then
+											tbl12.Grab(rootPart)
+										end
+									end
+
+									if now4 >= nSlow then
+										nSlow = now4 + 0.1
+										tbl12.ToggleCollisions(v23, false)
+
+										for _, track in ipairs(v25:GetPlayingAnimationTracks()) do
+											pcall(track.Stop, track, 0)
+										end
+
+										if v25.Health <= 0 then
+											pcall(function()
+												v25.Health = v25.MaxHealth
+											end)
+										end
+
+										if rootPart:FindFirstChild("Scream") then
+											rootPart.Scream.Playing = false
+										end
+									end
+
+									if tbl12.AGHeld() and tbl8.AntiGrab then
+										lostAt = nil
+									elseif not lostAt then
+										lostAt = now4
+									end
+
+									if flag11 or not tbl8.AntiGrab or not torso.Parent or (lostAt and now4 - lostAt > 0.06) then
+										finish()
+									end
+								end
+
+								connection = RunService.RenderStepped:Connect(function(deltaTime)
+									if not finished then
+										step(deltaTime, true)
+									end
+								end)
+
+								connection2 = RunService.Heartbeat:Connect(function(deltaTime)
+									if not finished then
+										step(deltaTime, false)
+									end
+								end)
+
+								-- first frame right now, not on the next signal
+								step(0, false)
+							end
 						end
-					end
 
 					do
 						local tbl16 = nil
@@ -23290,6 +23961,40 @@ end
 								end
 							end)
 						end
+
+						-- ALLOW SITTING, "re-gucci on jump off": doesn't touch fn24's own internals at all. While GucciAntiGrab
+						-- and Allow Sitting are both on, it just watches your Humanoid.SeatPart; the moment it goes from
+						-- seated to not-seated (you jumped/got up), it switches GucciAntiGrab off then back on through the
+						-- same public SetGucciAntiGrab used above, which makes fn24 destroy whatever it had and reacquire a
+						-- fresh one. Letting you sit on OTHER players' vehicles in the first place isn't something this
+						-- touches - I found no code here that blocks that, so if something still stops you, tell me what
+						-- happens and I'll look again.
+						task.spawn(function()
+							local wasSeated = false
+
+							while not flag11 do
+								task.wait(0.2)
+
+								if not (tbl8.AllowSitting and tbl8.GucciAntiGrab) then
+									wasSeated = false
+									continue
+								end
+
+								local v22, v23, v24 = tbl12.Char()
+								local seated = v24 and v24.SeatPart ~= nil
+
+								if wasSeated and not seated then
+									tbl12.SetGucciAntiGrab(false)
+									task.wait(0.1)
+
+									if tbl8.AllowSitting and toggles.GucciAntiGrab then
+										toggles.GucciAntiGrab:SetValue(true)
+									end
+								end
+
+								wasSeated = seated
+							end
+						end)
 					end
 				end
 
@@ -25321,6 +26026,293 @@ end
 						if arg and arg:IsA("Model") then
 							tbl11.DestroyToy:FireServer(arg)
 						end
+					end
+
+					-- SEATLESS BLOB, exact sequence: (1) spawn the Blobman at the fixed position, (2) sit on
+					-- it, (3) jump off, (4) run the kill/ragdoll/spam-sit code (ported from Inicio()), (5) once
+					-- we're really seated: anchor the VehicleSeat ("HRP") there, verified (re-asserted a few
+					-- times and only trusted once Anchored actually reads true), nothing else gets touched.
+					-- tbl7.SeatlessSequence is set for the whole attempt (from the moment we sit, since that's
+					-- what actually moves our character up to the spot) so Anti Void doesn't snap us back to
+					-- spawn mid-sequence. RETRY: any failure - spawn/sit/jump/seat not confirmed/anchor not
+					-- confirmed, OR the seat quietly breaking later while the model is still there, OR the
+					-- model being deleted outright - all count as "something went wrong" and retry the whole
+					-- sequence from spawn, up to 5 times total for this toggle-on, with a short pause between.
+					-- After 5 failures it gives up and teleports us back. Our own body/PCLD is otherwise never
+					-- welded or desynced - only the Blobman model ever gets touched. Whenever this toggle ends
+					-- (off, giving up, or replaced by a fresh toggle-on) we're teleported back to wherever we
+					-- were standing right before it first moved us.
+					local seatlessBlobPos = CFrame.new(0, 8000000, 0)
+					local seatlessRunId = 0
+
+					tbl12.SeatlessBlob = function(enable)
+						tbl7.SeatlessActive = false
+						tbl7.SeatlessSequence = false
+						if tbl7.SeatlessBlobModel and tbl7.SeatlessBlobModel.Parent then
+							tbl12.DestroyToy(tbl7.SeatlessBlobModel)
+						end
+						tbl7.SeatlessBlobModel = nil
+
+						-- TELEPORT BACK: whenever a previous attempt is being torn down (toggled off, a fresh
+						-- restart) - put us back where we were before Seatless Blob ever moved/seated us.
+						if tbl7.SeatlessHomeCF then
+							local _, oldRoot = tbl12.Char()
+							if oldRoot and oldRoot.Parent then
+								pcall(tbl12.Teleport, oldRoot, tbl7.SeatlessHomeCF)
+							end
+							tbl7.SeatlessHomeCF = nil
+						end
+
+						seatlessRunId += 1
+						if not enable then
+							return
+						end
+						local runId = seatlessRunId
+
+						task.spawn(function()
+							local character, root, humanoid = tbl12.Char()
+							if not (character and root and humanoid and humanoid.Health > 0) then
+								return
+							end
+
+							tbl7.SeatlessHomeCF = root.CFrame
+							local retriesUsed = 0
+
+							local function teleportHome()
+								if runId ~= seatlessRunId then
+									return
+								end
+								local _, curRoot = tbl12.Char()
+								if curRoot and curRoot.Parent and tbl7.SeatlessHomeCF then
+									pcall(tbl12.Teleport, curRoot, tbl7.SeatlessHomeCF)
+								end
+							end
+
+							local function giveUp()
+								tbl7.SeatlessActive = false
+								tbl7.SeatlessSequence = false
+								teleportHome()
+								if not flag11 then
+									pcall(function()
+										lib:Notify({
+											Title = "Resonance",
+											Description = "Seatless Blob: kept failing, gave up after " .. retriesUsed .. " tries.",
+											IconColor = Color3.new(1, 1, 1),
+										})
+									end)
+								end
+							end
+
+							local attempt
+
+							local function fail(blob)
+								if blob then
+									tbl12.DestroyToy(blob)
+								end
+								tbl7.SeatlessBlobModel = nil
+								tbl7.SeatlessActive = false
+								tbl7.SeatlessSequence = false
+
+								if runId ~= seatlessRunId or flag11 or not tbl8.SeatlessBlob then
+									return
+								end
+
+								retriesUsed = retriesUsed + 1
+								if retriesUsed >= 5 then
+									giveUp()
+									return
+								end
+
+								task.wait(0.5)
+								if runId == seatlessRunId and tbl8.SeatlessBlob then
+									attempt()
+								end
+							end
+
+							attempt = function()
+								if runId ~= seatlessRunId or flag11 then
+									return
+								end
+								local character2, root2, humanoid2 = tbl12.Char()
+								if not (character2 and root2 and humanoid2 and humanoid2.Health > 0) then
+									fail(nil)
+									return
+								end
+
+								tbl7.SeatlessSequence = true
+
+								-- 1. SPAWN at the fixed position
+								local blob = tbl12.SpawnToy("CreatureBlobman", seatlessBlobPos)
+								local blobHRP = blob and (blob:FindFirstChild("VehicleSeat") or blob:WaitForChild("VehicleSeat", 1))
+								if not blobHRP or runId ~= seatlessRunId then
+									fail(blob)
+									return
+								end
+								tbl7.SeatlessBlobModel = blob
+
+								-- 2. SIT
+								pcall(blobHRP.Sit, blobHRP, humanoid2)
+								task.wait(0.1)
+								if runId ~= seatlessRunId or not blobHRP.Parent then
+									fail(blob)
+									return
+								end
+
+								-- 3. JUMP OFF
+								pcall(function()
+									humanoid2.Jump = true
+								end)
+								task.wait(0.1)
+								if runId ~= seatlessRunId or flag11 or not blobHRP.Parent then
+									fail(blob)
+									return
+								end
+
+								-- 4. RUN THE CODE - ported verbatim from Inicio() (tick()-based, no extra guard before kill)
+								local t = tick()
+								local ragdollFired = false
+								humanoid2.Health = 0
+								task.wait(1)
+								while runId == seatlessRunId and tick() - t < 4 do
+									RunService.Heartbeat:Wait()
+									humanoid2.EvaluateStateMachine = false
+									humanoid2.BreakJointsOnDeath = false
+									if not ragdollFired then
+										pcall(function()
+											tbl11.RagdollRemote:FireServer(root2, math.huge)
+										end)
+										ragdollFired = true
+									end
+									if not humanoid2.SeatPart then
+										humanoid2.Sit = false
+									end
+									pcall(blobHRP.Sit, blobHRP, humanoid2)
+									pcall(function()
+										local prompt = blobHRP:FindFirstChild("ProximityPrompt") or blobHRP:FindFirstChildWhichIsA("ProximityPrompt")
+										if prompt then
+											fireproximityprompt(prompt)
+										end
+									end)
+									humanoid2.EvaluateStateMachine = true
+								end
+
+								local success = false
+								local startTime = tick()
+								while runId == seatlessRunId and tick() - startTime < 5 do
+									task.wait()
+									local occupant = blobHRP.Occupant
+									local _, _, ourHumanoid = tbl12.Char()
+									if occupant and (occupant == humanoid2 or occupant == ourHumanoid) then
+										success = true
+										break
+									end
+									local seatWeld = blobHRP:FindFirstChild("SeatWeld")
+									if seatWeld and seatWeld.Part1 and (seatWeld.Part1 == root2 or (ourHumanoid and seatWeld.Part1.Parent and seatWeld.Part1.Parent:FindFirstChildOfClass("Humanoid") == ourHumanoid)) then
+										success = true
+										break
+									end
+								end
+
+								if runId ~= seatlessRunId then
+									return
+								end
+
+								if not (success and blobHRP.Parent) then
+									fail(blob)
+									return
+								end
+
+								-- 5. ANCHOR THE HRP - verified: re-assert a few times and only trust it once
+								-- Anchored actually reads back true (physics this far out can be flaky)
+								local anchored = false
+
+								for _ = 1, 5 do
+									pcall(function()
+										blob:PivotTo(seatlessBlobPos)
+										blobHRP.AssemblyLinearVelocity = Vector3.zero
+										blobHRP.AssemblyAngularVelocity = Vector3.zero
+										blobHRP.Anchored = true
+									end)
+									task.wait()
+									if blobHRP.Anchored then
+										anchored = true
+										break
+									end
+								end
+
+								if not anchored then
+									fail(blob)
+									return
+								end
+
+								retriesUsed = 0
+								tbl7.SeatlessActive = true
+								tbl7.SeatlessSequence = false
+
+								-- parent upvalue fix (Blobman features): the Humanoid.Seated signal doesn't reliably
+								-- fire for a seat taken like this, so it's set directly and kept set.
+								parent = blob
+								task.spawn(function()
+									while blob.Parent and tbl7.SeatlessBlobModel == blob and tbl8.SeatlessBlob and runId == seatlessRunId do
+										parent = blob
+										task.wait(0.25)
+									end
+								end)
+
+								-- wait for the server-side Blobman remote components to appear
+								local componentsReady = false
+								local readyStarted = os.clock()
+								while os.clock() - readyStarted < 3 and runId == seatlessRunId and blob.Parent do
+									local components = tbl14.GetBlobmanComponents and tbl14.GetBlobmanComponents()
+									if components and components.CreatureGrab and components.RightWeld then
+										componentsReady = true
+										break
+									end
+									task.wait()
+								end
+
+								if not flag11 then
+									pcall(function()
+										lib:Notify({
+											Title = "Resonance",
+											Description = "Seatless Blob: seated - Anchored: " .. tostring(blobHRP.Anchored) .. " - Blobman remotes: " .. (componentsReady and "ready" or "not ready yet"),
+											IconColor = Color3.new(1, 1, 1),
+										})
+									end)
+								end
+
+								-- PERSISTENT WATCHDOG: covers both the blob getting deleted outright AND the seat
+								-- quietly breaking (bumped, re-ragdolled, whatever) while the model is still there -
+								-- either one is "something went wrong" and goes through the same retry as a fresh
+								-- failure, including the teleport-back.
+								task.spawn(function()
+									local unseatedChecks = 0
+
+									while runId == seatlessRunId and tbl8.SeatlessBlob and not flag11 and blob.Parent and tbl7.SeatlessBlobModel == blob do
+										task.wait(0.5)
+										-- judged on the BLOB, not on our current body: after the kill our new character is
+										-- (by design) not seated, the old one is - checking our own humanoid here made it think
+										-- the seat broke and re-run the whole kill sequence over and over
+										local seatHeld = blobHRP.Parent and (blobHRP.Occupant ~= nil or blobHRP:FindFirstChild("SeatWeld") ~= nil)
+										unseatedChecks = seatHeld and 0 or unseatedChecks + 1
+										local stillSeated = unseatedChecks < 6
+
+										if not stillSeated then
+											tbl7.SeatlessBlobModel = nil
+											fail(blob)
+											return
+										end
+									end
+
+									if runId == seatlessRunId and tbl8.SeatlessBlob and not flag11 then
+										tbl7.SeatlessBlobModel = nil
+										fail(nil)
+									end
+								end)
+							end
+
+							attempt()
+						end)
 					end
 
 					tbl12.GetInventory = function(arg)
@@ -29248,7 +30240,7 @@ end
 							tbl12.DestroyObject(v22, v23)
 							tbl16[v22] = true
 
-							task.delay(1, function()
+							task.delay(0.7, function() -- was 1s; SNO already spends up to ~0.65s trying, so a failed try now retries almost immediately
 								tbl16[v22] = nil
 							end)
 						end
@@ -29278,7 +30270,7 @@ end
 					if leftArm and v25 and v25.Health ~= 0 then
 						for _, v26 in pairs(leftArm:GetConnectedParts()) do
 							if v26.Name == "HoldPart" and not v26:IsDescendantOf(v17) then
-								tbl12.BreakHoldable(v26.Parent, 1, true)
+								tbl12.BreakHoldable(v26.Parent, tonumber(tbl9.DestroyFoodTimeout) or 1, tbl9.DestroyFoodMethod ~= "Breaking")
 							end
 						end
 					end
@@ -29297,14 +30289,45 @@ end
 					local v22, v23, v24 = tbl12.Char()
 					local v25, v26, v27 = tbl12.Char(arg)
 					local v28, v29 = tbl12.GetInventory(arg)
-					local gucciAntiGrab = tbl8.GucciAntiGrab
 
-					if not gucciAntiGrab then
-						gucciAntiGrab = not (v24 and v24.Health > 0 and v23 and v28)
+					if not (v24 and v24.Health > 0 and v23 and v28) then
+						return false
 					end
 
-					if gucciAntiGrab then
-						return false
+					-- PAUSE GUCCI: this used to refuse to run at all while GucciAntiGrab (riding your own) is on. We
+					-- still own the seat we're sitting in, so instead of refusing, hop off it, run the removal below
+					-- on the target's seat, then sit back on our own right after.
+					local resumeSeat = nil
+
+					if tbl8.GucciAntiGrab then
+						if not tbl8.PauseGucci then
+							return false
+						end
+
+						resumeSeat = v24.SeatPart
+					end
+
+					local function resumeOwnSeat()
+						if not (resumeSeat and resumeSeat.Parent) then
+							return
+						end
+
+						local _, __, humanoid = tbl12.Char()
+
+						if not (humanoid and humanoid.Parent and humanoid.Health > 0) then
+							return
+						end
+
+						if humanoid.Sit then
+							humanoid.Sit = false
+							task.wait(0.05)
+						end
+
+						if not resumeSeat.Occupant then
+							pcall(function()
+								resumeSeat:Sit(humanoid)
+							end)
+						end
 					end
 
 					local function fn21(arg2)
@@ -29395,7 +30418,9 @@ end
 					local seatPart = v27 and v27.SeatPart
 					if seatPart and not v27.Sit then
 						obj[seatPart] = nil
-						return fn21(seatPart)
+						fn21(seatPart)
+						resumeOwnSeat()
+						return
 					end
 
 					for _, v30 in v28:GetChildren() do
@@ -29419,6 +30444,8 @@ end
 							end
 						end
 					end
+
+					resumeOwnSeat()
 				end
 			end
 		end
@@ -29702,6 +30729,11 @@ end
 				return
 			end
 			local creatureBlobman = v17:FindFirstChild("CreatureBlobman")
+
+			-- never reuse the Seatless Blob's anchored toy here - it spawns its own fresh one instead
+			if creatureBlobman == tbl7.SeatlessBlobModel then
+				creatureBlobman = nil
+			end
 			local vehicleSeat = creatureBlobman and creatureBlobman:FindFirstChild("VehicleSeat")
 			local flag13 = vehicleSeat and (vehicleSeat.Occupant == nil or vehicleSeat.Occupant == v24)
 
@@ -29750,6 +30782,7 @@ end
 			if not (v24 and v25 and v25.Health > 0) or not parent then
 				return
 			end
+			local head = v23 and v23:FindFirstChild("Head")
 			local v26, v27, v28 = tbl12.Char(arg)
 			local rootAttachment = v27 and v27:FindFirstChild("RootAttachment")
 			if not (rootAttachment and v28 and v28.Health > 0) or not parent then
@@ -29758,28 +30791,62 @@ end
 			local now3 = tick()
 
 			if tbl12.GetMagnitude(v24, v27) > 40 then
-				local cFrame2 = v24.CFrame
-				currentCamera.CameraType = Enum.CameraType.Scriptable
-
-				while true do
-					local flag12 = parent and v27 and v27.Parent and v25.Health > 0 and v28.Health > 0 and rootAttachment and v22.RightWeld.Attachment0 ~= rootAttachment
-
-					if flag12 then
-						flag12 = tick() - now3 < (arg2 or 0.7)
+				-- WELD + DESYNC CAMERA, same as everywhere else: a direct CFrame glide every Heartbeat with
+				-- velocity zeroed, hidden behind the real Position Desync feature, snapped back home on
+				-- release - instead of the old CameraType.Scriptable + plain Teleport loop (slower, and didn't
+				-- hide/weld the same way the rest of the script does).
+				local homeCF = v24.CFrame
+				local homeHeadCF = head and head.CFrame
+				local chaseCF = v24.CFrame
+				pcall(tbl12.ToggleCollisions, v23, false)
+				RunService:BindToRenderStep("ClientVision", Enum.RenderPriority.Camera.Value - 1, function()
+					v24.CFrame = homeCF
+					if head then
+						head.CFrame = homeCF
 					end
+				end)
 
-					if flag12 then
-						tbl12.Teleport(v24, tbl12.PredictCFrame(v27) - Vector3.new(0, 15, 0))
-						task.wait()
-						v22.CreatureGrab:FireServer(nil, v27, v22.RightWeld)
-						continue
+				local connection = RunService.Heartbeat:Connect(function()
+					v24.CFrame = chaseCF
+					if head then
+						head.CFrame = chaseCF
 					end
+					v24.AssemblyLinearVelocity = Vector3.zero
+					v24.AssemblyAngularVelocity = Vector3.zero
+				end)
 
-					break
+				pcall(function()
+					while true do
+						local flag12 = parent and v27 and v27.Parent and v25.Health > 0 and v28.Health > 0 and rootAttachment and v22.RightWeld.Attachment0 ~= rootAttachment
+
+						if flag12 then
+							flag12 = tick() - now3 < (arg2 or 0.7)
+						end
+
+						if flag12 then
+							chaseCF = tbl12.PredictCFrame(v27) - Vector3.new(0, 15, 0)
+							RunService.Heartbeat:Wait()
+							v22.CreatureGrab:FireServer(nil, v27, v22.RightWeld)
+							continue
+						end
+
+						break
+					end
+				end)
+
+				connection:Disconnect()
+				pcall(function()
+					RunService:UnbindFromRenderStep("ClientVision")
+				end)
+
+				pcall(tbl12.ToggleCollisions, v23, true)
+
+				if head and homeHeadCF then
+					head.CFrame = homeHeadCF
 				end
 
-				tbl12.Teleport(v24, cFrame2, CFrame.new(0, 5, 0))
-				currentCamera.CameraType = Enum.CameraType.Custom
+				v24.CFrame = homeCF
+				tbl12.ReturnPCLD()
 			else
 				v22.CreatureGrab:FireServer(nil, v27, v22.RightWeld)
 				task.wait(0.1)
@@ -29802,6 +30869,7 @@ end
 			if not (v24 and v25 and v25.Health > 0) or not parent then
 				return
 			end
+			local head = v23 and v23:FindFirstChild("Head")
 			local v26, v27, v28 = tbl12.Char(arg)
 			if not (v27 and v28 and v28.Health > 0) or not parent then
 				return
@@ -29811,6 +30879,11 @@ end
 				return true
 			end
 			local now3 = tick()
+
+			-- EXPERIMENT, untested: with Seatless Blob we're genuinely seated on the (far away, anchored)
+			-- blob the whole time - moving/welding our own body would drag the blob there too since we're
+			-- welded to its seat, which defeats the point of welding ourselves at all. Never weld in that
+			-- case; just fire the remotes below with nothing moving. Tell me if this actually works.
 			local flag12 = tbl12.GetMagnitude(v24, v27) >= 40
 			if flag12 and tbl7.States.Owning then
 				return
@@ -29819,32 +30892,67 @@ end
 			local cframe = CFrame.new()
 			local cframe2 = CFrame.new()
 			local connection = nil
+			local desyncWasOn = nil
 			tbl7.States.Owning = true
 
+			-- WELD + DESYNC CAMERA, same as everywhere else: direct CFrame glide with velocity zeroed,
+			-- hidden behind the real Position Desync feature - instead of the old "ClientVision" RenderStep
+			-- bind on its own (no velocity zero, no collision toggle, no head), which is the slow/janky one.
 			local function fn21()
 				cframe = v24.CFrame
 				cframe2 = v24.CFrame
-
+				pcall(tbl12.ToggleCollisions, v23, false)
 				RunService:BindToRenderStep("ClientVision", Enum.RenderPriority.Camera.Value - 1, function()
 					v24.CFrame = cframe
+					if head then
+						head.CFrame = cframe
+					end
 				end)
 
+				-- also keep his own body from desyncing/flailing on his screen while we chase him around
+				if sethiddenproperty then
+					pcall(sethiddenproperty, v27, "NetworkIsSleeping", true)
+				end
+
 				connection = RunService.Heartbeat:Connect(function()
-					cframe = v24.CFrame
+					-- REACT FASTER: track the predicted target position every Heartbeat, not just once per
+					-- remote-pacing cycle below - the weld now keeps up with him at full frame rate.
+					if flag12 then
+						cframe2 = tbl12.PredictCFrame(v27) - Vector3.new(0, 15, 0)
+					end
+
 					v24.CFrame = cframe2
+					if head then
+						head.CFrame = cframe2
+					end
+					v24.AssemblyLinearVelocity = Vector3.zero
+					v24.AssemblyAngularVelocity = Vector3.zero
 				end)
 			end
 
 			local function fn22()
-				RunService:UnbindFromRenderStep("ClientVision")
-
 				if connection then
 					connection:Disconnect()
 					connection = nil
 				end
 
+				pcall(function()
+					RunService:UnbindFromRenderStep("ClientVision")
+				end)
+
+				pcall(tbl12.ToggleCollisions, v23, true)
+
+				if head then
+					head.CFrame = cframe
+				end
+
 				if v24 then
 					v24.CFrame = cframe
+				end
+				tbl12.ReturnPCLD()
+
+				if sethiddenproperty then
+					pcall(sethiddenproperty, v27, "NetworkIsSleeping", false)
 				end
 			end
 
@@ -29862,16 +30970,12 @@ end
 						end
 
 						if flag13 then
-							local v29 = tbl12.PredictCFrame(v27)
 							v22.RightWeld.Enabled = false
 
-							if flag12 then
-								cframe2 = v29 - Vector3.new(0, 15, 0)
-							end
-
-							task.wait(0.011111111111111112)
+							-- a tiny bit faster again
+							task.wait(0.008861111111111112)
 							v22.CreatureGrab:FireServer(nil, v27, v22.RightWeld)
-							task.wait(0.011111111111111112)
+							task.wait(0.008861111111111112)
 							v22.CreatureRelease:FireServer(v22.RightWeld)
 							continue
 						end
@@ -29945,11 +31049,24 @@ end
 				local cFrame2 = v24.CFrame * CFrame.Angles(0, i / #tbl16 * 3.1415926535897931 * 2, 0) * CFrame.new(0, 5, -20)
 				v26.CFrame = cFrame2
 				tbl12.Teleport(v26.Root, cFrame2)
-				local v27, v28 = tbl12.CreateAlign(v26.Root, true)
 				local position = cFrame2.Position
 				local cFrame3 = cFrame2 - cFrame2.Position
+
+				-- COMPLETELY STABLE HOLD: the same BodyPosition+BodyGyro hold the generic (non-Blob) Kick
+				-- uses ("KickAP"/"KickAO"), not AlignPosition/AlignOrientation - just a tiny bit stronger
+				-- than its stock D.
+				local v27 = Instance.new("BodyPosition")
+				local v28 = Instance.new("BodyGyro")
+				v27.D = 220
+				v27.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
 				v27.Position = position
+				v27.Parent = v26.Root
+				v27.Name = "BlobKickAP"
+				v28.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+				v28.D = 220
 				v28.CFrame = cFrame3
+				v28.Parent = v26.Root
+				v28.Name = "BlobKickAO"
 				local n36 = #tbl17 + 1
 				local n37 = #tbl17 + 2
 				tbl17[n36] = v27
@@ -29974,6 +31091,8 @@ end
 
 			v22.CreatureGrab:FireServer(nil, v24, v22.RightWeld)
 
+			local sleepSet = {}
+
 			local function fn21()
 				if v22.RightWeld.Parent then
 					local rightWeld = v22.RightWeld
@@ -29986,24 +31105,45 @@ end
 						v26:Destroy()
 					end
 				end
+
+				-- let their body stop being "asleep" - we never touch/claim his own PCLD, only this
+				if sethiddenproperty then
+					for _, v26 in ipairs(tbl16) do
+						if v26.Root.Parent and sleepSet[v26.Root] then
+							pcall(sethiddenproperty, v26.Root, "NetworkIsSleeping", false)
+						end
+					end
+				end
 			end
 
 			local n36 = os.clock() + 2
 
-			while true do
-				for _, v26 in ipairs(tbl16) do
-					if v26.Root.Parent then
-						v26.Root.CFrame = v26.CFrame
-						tbl12.ResetVelocity(v26.Root)
-					end
-				end
+			-- GUARANTEED CLEANUP: one error anywhere in this hold (a destroyed Root, whatever) used to skip
+			-- fn21 entirely, leaking the BlobKickAP/AO, the claimed NetworkIsSleeping on each target, and the
+			-- RightWeld attachment reset - the same kind of silent corruption fixed in LoopKick just now.
+			pcall(function()
+				while true do
+					for _, v26 in ipairs(tbl16) do
+						if v26.Root.Parent then
+							v26.Root.CFrame = v26.CFrame
+							tbl12.ResetVelocity(v26.Root)
 
-				RunService.Heartbeat:Wait()
-				if not (n36 <= os.clock()) then
-					continue
+							-- IMPROVE THE HOLD + stop his own body desyncing/flailing on his screen while we run
+							-- around: same NetworkIsSleeping trick used in every other kick, always released above.
+							-- Not his PhysicsRepRootPart/PCLD - that stays untouched.
+							if sethiddenproperty and not sleepSet[v26.Root] then
+								sleepSet[v26.Root] = pcall(sethiddenproperty, v26.Root, "NetworkIsSleeping", true)
+							end
+						end
+					end
+
+					RunService.Heartbeat:Wait()
+					if not (n36 <= os.clock()) then
+						continue
+					end
+					break
 				end
-				break
-			end
+			end)
 
 			fn21()
 			return true
@@ -30171,6 +31311,37 @@ end
 			end
 		end
 
+		-- INSTANT DEATH ON RESPAWN: once Blob Kill lands on someone, arm a one-shot watcher on their
+		-- CharacterAdded - the moment their new character actually appears (right near spawn, before they
+		-- can move), immediately run the exact same tbl14.Kill on them again. Each successful kill re-arms
+		-- the watcher for the next respawn, so it keeps chaining as long as he's still Blob-selected and
+		-- Blob Method is still "Kill"; stops the instant either of those is no longer true.
+		local blobKillRespawnWatchers = setmetatable({}, { __mode = "k" })
+
+		tbl12.ArmBlobKillRespawn = function(player)
+			if not player or blobKillRespawnWatchers[player] then
+				return
+			end
+
+			local connection
+
+			connection = player.CharacterAdded:Connect(function()
+				blobKillRespawnWatchers[player] = nil
+
+				if connection then
+					connection:Disconnect()
+				end
+
+				if flag11 or not tbl7.SelectedPlayersBlob[player] or tbl9.BlobMethod ~= "Kill" then
+					return
+				end
+
+				task.spawn(tbl14.Kill, player)
+			end)
+
+			blobKillRespawnWatchers[player] = connection
+		end
+
 		tbl14.Kill = function(arg)
 			if not parent then
 				return
@@ -30184,17 +31355,35 @@ end
 				return
 			end
 
-			if not (v27.Sit and v27.SeatPart) and tbl14.Release(arg) then
+			if not (v27.Sit and v27.SeatPart) and (tbl14.Release(arg) or tbl14.Release(arg, 1.2)) then
 				v27.BreakJointsOnDeath = false
-				v27:ChangeState(Enum.HumanoidStateType.Dead)
-				task.wait()
+				-- make sure it actually lands: keep killing for a moment, then fall back to the normal Kill
+				local killUntil = tick() + 1
+				while v27.Parent and v27.Health > 0 and tick() < killUntil do
+					v27.BreakJointsOnDeath = false
+					v27:ChangeState(Enum.HumanoidStateType.Dead)
+					task.wait()
+				end
+
+				if v27.Parent and v27.Health > 0 then
+					tbl12.Kill(arg)
+				end
+
+				tbl12.ReturnPCLD()
+				tbl12.ArmBlobKillRespawn(arg)
 				return true
 			end
 
 			if v27.Sit and v27.SeatPart and tbl14.Bring(arg) then
 				tbl12.Kill(arg)
+				tbl12.ReturnPCLD()
+				tbl12.ArmBlobKillRespawn(arg)
 				return true
 			end
+
+			-- hand our own PCLD back even on a failed attempt (Release may have welded briefly before
+			-- giving up without ever reaching fn22)
+			tbl12.ReturnPCLD()
 		end
 
 		tbl14.RemoveGucci = function(arg)
@@ -30283,7 +31472,7 @@ end
 				return
 			end
 			local v22, v23, v24 = tbl12.Char()
-			if not (v23 and v24 and v24.SeatPart) then
+			if not (v23 and v24 and (v24.SeatPart or tbl7.SeatlessActive)) then
 				return
 			end
 			local v25, v26, v27 = tbl12.Char(arg)
@@ -30318,8 +31507,24 @@ end
 
 				local n36 = v23.CFrame * CFrame.new(options.BlobKickX.Value, options.BlobKickY.Value, options.BlobKickZ.Value)
 				tbl12.Teleport(v26, n36)
-				local v29, v30 = tbl12.CreateAlign(v26, true)
+
+				-- COMPLETELY STABLE HOLD: the same BodyPosition+BodyGyro hold the generic (non-Blob) Kick
+				-- uses ("KickAP"/"KickAO"), not AlignPosition/AlignOrientation - just a tiny bit stronger
+				-- than its stock D.
+				local v29 = Instance.new("BodyPosition")
+				local v30 = Instance.new("BodyGyro")
+				v29.P = 60000
+					v29.D = 500
+				v29.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
 				v29.Position = n36.Position
+				v29.Parent = v26
+				v29.Name = "BlobKickAP"
+				v30.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+				v30.P = 15000
+					v30.D = 450
+				v30.CFrame = CFrame.new()
+				v30.Parent = v26
+				v30.Name = "BlobKickAO"
 
 				task.delay(0.2, function()
 					tbl12.Grab(v26)
@@ -30331,55 +31536,103 @@ end
 				task.wait(0.06)
 				rootAttachment.Parent = v25
 
-				while arg.Parent and v26.Parent and v27.Parent and v27.Health > 0 and parent and parent.Parent and tbl7.SelectedPlayersBlob[arg] and tbl8.LoopApplyMethod and tbl9.BlobMethod == "Kick" and tbl12.GetMagnitude(v23, v26) <= 41 and not v27.SeatPart and v24.Sit do
-					task.spawn(function()
-						v27.RequiresNeck = false
-						tbl12.ToggleMotor6D(v25, false, true)
-						tbl12.RepositionLimbs(v25)
-					end)
+				-- IMPROVE THE HOLD + stop his own body desyncing/flailing on his screen while we run around:
+				-- same NetworkIsSleeping trick used in every other kick. Released right after the loop ends.
+				if sethiddenproperty then
+					pcall(sethiddenproperty, v27, "NetworkIsSleeping", true)
+				end
 
-					task.spawn(tbl12.ToggleCollisions, v25, false)
-					v28.RightOri.Enabled = false
-					v28.RightWeld.Enabled = false
-					v28.RightOri.Attachment0 = nil
-					v28.RightWeld.Attachment0 = nil
+				-- (the blob is no longer hidden while looping - it stays visible)
+				local blobTCache = {}
+
+				-- CLEAN, NOT BUMPY (at least on our end): the hold's Position/velocity used to only get
+				-- refreshed once per remote-pacing cycle (~13ms), with physics free to drift him in between -
+				-- that gap is what looked "bumpy". A separate per-Heartbeat connection now keeps him pinned
+				-- every single frame, completely decoupled from how often the remotes themselves fire.
+				local smoothConn = RunService.Heartbeat:Connect(function()
 					v29.Position = (v23.CFrame * CFrame.new(options.BlobKickX.Value, options.BlobKickY.Value, options.BlobKickZ.Value)).Position
 					tbl12.ResetVelocity(v26)
+				end)
 
-					if tbl8.DeleteShurInBlobK then
-						task.spawn(tbl12.RemoveSticky, v25)
-					end
+				-- GUARANTEED CLEANUP: a single error anywhere in this loop (a destroyed RightWeld/RightOri,
+				-- weldConstraint gone, whatever) used to leave rootAttachment permanently reparented into v25,
+				-- the BodyPosition/BodyGyro never destroyed, NetworkIsSleeping/transparency never restored -
+				-- silent corruption that gets worse the more times Blob Kick is used, and a plausible
+				-- contributor to things getting unstable over a long session. Now wrapped in pcall with
+				-- cleanup always running after, success or not.
+				pcall(function()
+					while arg.Parent and v26.Parent and v27.Parent and v27.Health > 0 and parent and parent.Parent and tbl7.SelectedPlayersBlob[arg] and tbl8.LoopApplyMethod and tbl9.BlobMethod == "Kick" and tbl12.GetMagnitude(v23, v26) <= 41 and not v27.SeatPart and (v24.Sit or tbl7.SeatlessActive) do
+						task.spawn(function()
+							v27.RequiresNeck = false
+							tbl12.ToggleMotor6D(v25, false, true)
+							tbl12.RepositionLimbs(v25)
+						end)
 
-					if tbl9.BKMethod == 1 then
-						v28.CreatureGrab:FireServer(nil, v26, v28.RightWeld)
-						task.wait()
-						v28.CreatureDrop:FireServer(v28.RightWeld)
-						task.wait()
+						task.spawn(tbl12.ToggleCollisions, v25, false)
+						v28.RightOri.Enabled = false
+						v28.RightWeld.Enabled = false
+						v28.RightOri.Attachment0 = nil
+						v28.RightWeld.Attachment0 = nil
 
-						if tbl8.NetworkOwnerInKick then
+						if tbl8.DeleteShurInBlobK then
+							task.spawn(tbl12.RemoveSticky, v25)
+						end
+
+						-- both Blob Kick methods down another 0.0015s
+						if tbl9.BKMethod == 1 then
+							v28.CreatureGrab:FireServer(nil, v26, v28.RightWeld)
+							task.wait(0.01385)
+							v28.CreatureDrop:FireServer(v28.RightWeld)
+							task.wait(0.01385)
+
+							if tbl8.NetworkOwnerInKick then
+								tbl12.Grab(v26)
+								tbl12.RNO(v26)
+							end
+						else
+							v28.CreatureGrab:FireServer(nil, v26, v28.RightWeld)
+							task.wait(0.01335)
+							v28.CreatureRelease:FireServer(v28.RightWeld)
 							tbl12.Grab(v26)
-							tbl12.RNO(v26)
-						end
-					else
-						v28.CreatureGrab:FireServer(nil, v26, v28.RightWeld)
-						task.wait()
-						v28.CreatureRelease:FireServer(v28.RightWeld)
-						tbl12.Grab(v26)
-						task.spawn(tbl12.Ragdoll, v25)
+							task.spawn(tbl12.Ragdoll, v25)
 
-						if weldConstraint.Enabled then
-							tbl12.RNO(v26)
-						end
+							if weldConstraint.Enabled then
+								tbl12.RNO(v26)
+							end
 
-						task.wait()
+							task.wait(0.01335)
+						end
+					end
+				end)
+
+				smoothConn:Disconnect()
+
+				if sethiddenproperty then
+					pcall(sethiddenproperty, v27, "NetworkIsSleeping", false)
+				end
+
+				for descendant, transparency in pairs(blobTCache) do
+					if descendant.Parent then
+						descendant.Transparency = transparency
 					end
 				end
 
-				rootAttachment.Parent = v26
+				if rootAttachment then
+					pcall(function()
+						rootAttachment.Parent = v26
+					end)
+				end
+
 				task.spawn(tbl12.ToggleMotor6D, v25, true)
 				task.spawn(tbl12.ToggleCollisions, v25, true)
-				v30:Destroy()
-				v29:Destroy()
+
+				if v30 then
+					pcall(v30.Destroy, v30)
+				end
+
+				if v29 then
+					pcall(v29.Destroy, v29)
+				end
 			end
 		end
 
@@ -31808,10 +33061,15 @@ end
 				end
 
 				connection = v24.Seated:Connect(function(arg, arg2)
-					if arg and arg2 and arg2.Parent and arg2.Parent.Name == "CreatureBlobman" then
+					-- the Seatless Blob is renamed to avoid being picked up by Sit on Blobman / Blob Kick Player /
+					-- Auto Sit Blobman's own lookups, but sitting on it should still count for Kick/Kill/etc - so
+					-- it's matched by reference here too, not just by the stock "CreatureBlobman" name.
+					if arg and arg2 and arg2.Parent and (arg2.Parent.Name == "CreatureBlobman" or arg2.Parent == tbl7.SeatlessBlobModel) then
 						parent = arg2.Parent
 					else
-						parent = nil
+						-- Seatless Blob keeps `parent` on its blob even though our (new) body isn't on it
+						local seatless = tbl7.SeatlessActive and tbl7.SeatlessBlobModel
+						parent = seatless and seatless.Parent and seatless or nil
 					end
 				end)
 			end
@@ -32742,8 +34000,15 @@ Escape Timer: %*]]
 					return
 				end
 				local n36 = -2 ^ (20 + tbl9.LagLines)
-				local cframe = CFrame.new(n36, 0, n36)
-				tbl11.CreateGrabLine:FireServer(spawnLocation, cframe)
+				-- MUCH stronger: several lines per frame (more with a higher strength), pointing in different
+				-- directions so they can't collapse into one
+				local reps = 2 + math.floor(tbl9.LagLines / 2)
+
+				for i = 1, reps do
+					local sign = (i % 2 == 0) and 1 or -1
+					local cframe = CFrame.new(n36 * sign, (i % 3 == 0) and n36 or 0, n36 * -sign)
+					tbl11.CreateGrabLine:FireServer(spawnLocation, cframe)
+				end
 			end
 		end)
 
@@ -32803,6 +34068,37 @@ Escape Timer: %*]]
 		end)
 
 		isHeld:GetPropertyChangedSignal("Value"):Connect(tbl12.AntiGrab)
+		-- Anti-Grab: a PartOwner of somebody else on ANY part of our character starts the pin at once (IsHeld alone came a moment later,
+		-- and a grab on the torso / root never tagged the head).
+		do
+			local function agPartOwner(partOwner)
+				if flag11 or not tbl8.AntiGrab then
+					return
+				end
+		
+				if not tbl7.States["Anti Grab"] then
+					task.defer(tbl12.AntiGrab)
+				end
+			end
+		
+			local function agHookCharacter(character)
+				if not character then
+					return
+				end
+		
+				lib:GiveSignal(character.DescendantAdded:Connect(function(descendant)
+					if descendant.Name == "PartOwner" then
+						agPartOwner(descendant)
+						lib:GiveSignal(descendant:GetPropertyChangedSignal("Value"):Connect(function()
+							agPartOwner(descendant)
+						end))
+					end
+				end))
+			end
+		
+			agHookCharacter(localPlayer.Character)
+			lib:GiveSignal(localPlayer.CharacterAdded:Connect(agHookCharacter))
+		end
 
 		task.spawn(function()
 			local v22 = nil
@@ -32883,7 +34179,7 @@ Escape Timer: %*]]
 			local v23 = nil
 
 			while true do
-				task.wait(tbl9.InputLgDelay)
+				task.wait(tbl9.AntiOwnerMethod == "Fast Grab & Drop" and 0.01 or tbl9.InputLgDelay)
 
 				if flag11 then
 					if v22 then
@@ -32913,6 +34209,17 @@ Escape Timer: %*]]
 						v22 = tbl12.SpawnToy(tbl9.AntiInputType, CFrame.new(0, 1e20, 0), nil, true)
 						if not v22 then
 							continue
+						end
+
+						if tbl9.AntiOwnerMethod == "Silent" then
+							for _, v22Sound in pairs(v22:GetDescendants()) do
+								if v22Sound:IsA("Sound") then
+									pcall(function()
+										v22Sound.Volume = 0
+										v22Sound:Stop()
+									end)
+								end
+							end
 						end
 					end
 
@@ -33066,6 +34373,11 @@ Escape Timer: %*]]
 				end
 
 				flag12 = flag12 and not ((v23.Position - part3.Position).Magnitude < 150)
+
+				-- EXEMPTION: never snap us back while Seatless Blob is spawning/seating us or already
+				-- sitting at its (intentionally huge) Y coordinate - that's exactly what this check would
+				-- otherwise "correct" within 30ms, which is why the blob never seemed to land where asked.
+				flag12 = flag12 and not tbl7.SeatlessSequence and not tbl7.SeatlessActive
 
 				if flag12 then
 					tbl12.Teleport(v23, CFrame.new(0, 15, 0))
@@ -33615,6 +34927,82 @@ Escape Timer: %*]]
 			end)
 		end
 
+		tbl12.RejectRagdoll = function(character, humanoid, hrp)
+			if not (character and humanoid and hrp) then
+				return
+			end
+
+			pcall(function()
+				local ragdolled = humanoid:FindFirstChild("Ragdolled")
+
+				if ragdolled and ragdolled.Value then
+					ragdolled.Value = false
+				end
+			end)
+
+			pcall(function()
+				tbl11.RagdollRemote:FireServer(hrp, 0)
+			end)
+
+			if not humanoid.SeatPart then
+				humanoid.Sit = false
+			end
+
+			humanoid.AutoRotate = true
+			pcall(ContextActionService.UnbindAction, ContextActionService, "JumpRemover")
+			pcall(humanoid.SetStateEnabled, humanoid, Enum.HumanoidStateType.Jumping, true)
+
+			local weldHRP = hrp:FindFirstChild("WeldHRP")
+
+			if weldHRP and not weldHRP.Enabled then
+				weldHRP.Enabled = true
+			end
+
+			pcall(tbl12.ToggleMotor6D, character, true, true)
+			pcall(tbl12.RepositionLimbs, character, true)
+			pcall(tbl12.ToggleCollisions, character, false, false, true)
+
+			-- a full ResetVelocity (zeroing X/Y/Z) is what was desyncing your PCLD while sprinting: it's a sudden
+			-- stop from full speed to zero in one frame, which the server reads as an invalid movement jump. Only
+			-- the vertical component is a snowball/ragdoll impulse, so only that gets cancelled - your horizontal
+			-- (running) velocity carries through and the server sees continuous movement instead of a snap-stop.
+			pcall(function()
+				hrp.AssemblyAngularVelocity = Vector3.zero
+				local velocity = hrp.AssemblyLinearVelocity
+				hrp.AssemblyLinearVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+			end)
+		end
+
+		-- instant reaction: the moment ANYTHING sets Humanoid.Ragdolled true (a snowball, a fall, anything else), it is
+		-- rejected the same frame instead of waiting on the 0.03s poll below. One hook per character, re-made on respawn.
+		do
+			local asConn = nil
+
+			local function hookRagdolled(character)
+				if asConn then
+					asConn:Disconnect()
+					asConn = nil
+				end
+
+				local humanoid = character and character:FindFirstChild("Humanoid")
+				local hrp = character and character:FindFirstChild("HumanoidRootPart")
+				local ragdolled = humanoid and humanoid:FindFirstChild("Ragdolled")
+
+				if not ragdolled then
+					return
+				end
+
+				asConn = ragdolled:GetPropertyChangedSignal("Value"):Connect(function()
+					if not flag11 and tbl8.AntiSnowball and ragdolled.Value then
+						tbl12.RejectRagdoll(character, humanoid, hrp)
+					end
+				end)
+			end
+
+			hookRagdolled(localPlayer.Character)
+			localPlayer.CharacterAdded:Connect(hookRagdolled)
+		end
+
 		task.spawn(function()
 			task.wait(0.5)
 
@@ -33650,27 +35038,25 @@ Escape Timer: %*]]
 					end
 				end
 
+				-- a steady backup sweep (the instant hook above handles the common case): reject ALL ragdolls unconditionally,
+				-- not only while WeldHRP happens to already be enabled, and also when WeldHRP itself is the only thing that
+				-- flipped (some ragdoll triggers disable it without ever touching the Ragdolled value).
 				local v22, v23, v24 = tbl12.Char()
-				local weldHRP = v23 and v23:FindFirstChild("WeldHRP")
 
-				if not (not weldHRP or not v24 or v24.Health == 0 or not v23) then
-					tbl11.RagdollRemote:FireServer(v23, 0.5)
+				if v22 and v23 and v24 and v24.Health > 0 then
+					local ragdolled = v24:FindFirstChild("Ragdolled")
 
-					if not v24.SeatPart then
-						v24.Sit = false
-					end
-
-					v24.AutoRotate = true
-
-					if weldHRP.Enabled then
-						ContextActionService:UnbindAction("JumpRemover")
-						v24:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-						tbl12.RepositionLimbs(v22)
-						tbl12.ToggleCollisions(v22, false, false, true)
+					-- V2: WeldHRP disabled on its own is NOT ragdoll - it also happens during ordinary jumping/falling, and
+					-- treating it as ragdoll zeroed your velocity (ResetVelocity in RejectRagdoll) on every 0.03s poll,
+					-- killing jumps before they got anywhere. Only the real Ragdolled flag triggers the reject now; the
+					-- instant hook above (on Ragdolled's own Changed signal) still catches genuine ragdolls immediately.
+					if ragdolled and ragdolled.Value then
+						tbl12.RejectRagdoll(v22, v24, v23)
 					end
 				end
 			end
 		end)
+
 
 		task.spawn(function()
 			task.wait(2)
@@ -33739,7 +35125,7 @@ Escape Timer: %*]]
 					if arg == "Flying" then
 						local now3 = tick()
 
-						if now3 - n36 > 1 then
+						if now3 - n36 > (tonumber(tbl9.FlagResetTimer) or 1) then
 							n36 = now3
 							tbl9.KickFlags = 1
 						else
@@ -33747,17 +35133,20 @@ Escape Timer: %*]]
 						end
 
 						if tbl8.AutoReset then
-							if tbl9.KickFlags >= 4 and tbl8.AutoLeave then
+							if tbl9.KickFlags >= (tonumber(tbl9.FlagsBeforeLeaving) or 4) and tbl8.AutoLeave then
 								return localPlayer:Kick("Resonance (Auto Reset)\nAvoided Kick")
 							end
-							local v22, v23, v24 = tbl12.Char()
 
-							if v24 then
-								v24:ChangeState(Enum.HumanoidStateType.Running)
-								v24:ChangeState(Enum.HumanoidStateType.Dead)
+							if tbl9.KickFlags >= (tonumber(tbl9.FlagsBeforeReset) or 1) then
+								local v22, v23, v24 = tbl12.Char()
 
-								if tbl9.KickFlags == 1 then
-									fn18("Reset due to kick flag", "Auto Reset")
+								if v24 then
+									v24:ChangeState(Enum.HumanoidStateType.Running)
+									v24:ChangeState(Enum.HumanoidStateType.Dead)
+
+									if tbl9.KickFlags == (tonumber(tbl9.FlagsBeforeReset) or 1) then
+										fn18("Reset due to kick flag", "Auto Reset")
+									end
 								end
 							end
 						end
@@ -34747,11 +36136,31 @@ Escape Timer: %*]]
 			end
 		end)
 
+		tbl12.OwnerTag = function(arg)
+			if not arg then
+				return nil
+			end
+
+			local parent = arg.Parent
+			local head = parent and parent:FindFirstChild("Head")
+			local partOwner = head and head:FindFirstChild("PartOwner")
+			partOwner = partOwner or arg:FindFirstChild("PartOwner")
+			partOwner = partOwner or (parent and parent:FindFirstChild("PartOwner", true))
+
+			if not partOwner then
+				return nil
+			end
+
+			return partOwner.Value
+		end
+
 		task.spawn(function()
 			local tbl16 = {}
 
 			local function fn21(arg, arg2)
-				if not arg or not tbl8.EKI then
+				-- releasing (arg2 == nil) must ALWAYS go through, even after EKI got toggled off - otherwise the PCLD
+				-- we claimed stays stuck on his root and is never handed back.
+				if not arg or (arg2 and not tbl8.EKI) then
 					return
 				end
 
@@ -34783,8 +36192,12 @@ Escape Timer: %*]]
 						weldHRP.Enabled = true
 					end
 
-					if tbl12.IsNetworkOwner(v23) then
-						fn21(v23, nil)
+					-- always hand the PCLD back (not only while we still own him)
+					fn21(v23, nil)
+
+					-- and always let his own body go back to normal replication
+					if sethiddenproperty then
+						pcall(sethiddenproperty, v23, "NetworkIsSleeping", false)
 					end
 				end
 
@@ -34792,15 +36205,94 @@ Escape Timer: %*]]
 					task.spawn(tbl12.ToggleMotor6D, v22, true, true)
 					task.spawn(tbl12.ToggleCollisions, v22, true)
 				end
+
+				tbl16[arg] = nil
 			end
 
 			local function fn23(arg, arg2, arg3)
-				local n36 = 6.2831853071795862 / arg3 * (arg2 - 1)
+				-- arg2 = index 1..arg3 for however many targets are selected. Exactly 1 target: directly above us.
+				-- 2 or more: back to a circle around us (10 stud radius), so they don't stack on the same point.
 				local nkOffset = tbl9.NKOffset
+
+				if arg3 <= 1 then
+					return arg.Position + Vector3.new(0, nkOffset, 0)
+				end
+
+				local n36 = 6.2831853071795862 / arg3 * (arg2 - 1)
 				return arg.Position + Vector3.new(math.cos(n36) * 10, nkOffset, math.sin(n36) * 10)
 			end
 
-			while task.wait() do
+			-- EKI: a single delayed self-claim per acquisition, matching the original design, instead of a
+			-- continuously re-asserting/releasing state machine. That state machine fought the kick's own fast
+			-- claim/release cadence over the same root at the same time, which is almost certainly why "EKI
+			-- bugs the whole kick" and the kick alone couldn't hold the target either. Claim once, 0.6s after
+			-- we first see ownership, and leave it alone; always released on cleanup (fn22, unconditional).
+			local function ekiFrame(st, target, inRange)
+				if not tbl8.EKI or not sethiddenproperty or not inRange then
+					return
+				end
+
+				local root = st.root2
+				if not root or st.ekiScheduledFor == root then
+					return
+				end
+				st.ekiScheduledFor = root
+
+				task.delay(0.6, function()
+					if st.ekiScheduledFor == root then
+						st.ekiScheduledFor = nil
+					end
+
+					if flag11 or not tbl8.EKI or not root.Parent or not tbl12.IsNetworkOwner(root) then
+						return
+					end
+
+					local _, ourRoot = tbl12.Char()
+					-- the kick hold itself parks him NKOffset above us, so "over us" = clearly higher than that
+					if ourRoot and root.Position.Y > ourRoot.Position.Y + (tonumber(tbl9.NKOffset) or 0) + 6 then
+						return
+					end
+
+					fn21(root, root)
+				end)
+			end
+
+			-- DELAY MODE "Blob Remotes": while kicking, also fire the Blobman's CreatureDrop (makes the kick land
+			-- harder) and CreatureRelease (the hold) on its right hand. Needs us to be in a Blobman (or Seatless Blob).
+			local function blobRemotes(st)
+				if tbl9.NKDelayMode ~= "Blob Remotes" or not parent then
+					return
+				end
+				-- as many CreatureDrop/CreatureRelease as the Blobman Release Kick sends: no pacing at all, a burst
+				-- EVERY frame (3 at normal ping, fewer only when the ping governor says we are spiking)
+				local burst = 3
+				local lv = tbl12.PingLevel()
+
+				if lv >= 2 then
+					burst = 1
+				elseif lv == 1 then
+					burst = 2
+				end
+				local components = tbl14.GetBlobmanComponents and tbl14.GetBlobmanComponents()
+
+				if components and components.RightWeld then
+					for _ = 1, burst do
+						if components.CreatureGrab and st.root2 then
+							components.CreatureGrab:FireServer(nil, st.root2, components.RightWeld)
+						end
+
+						if components.CreatureDrop then
+							components.CreatureDrop:FireServer(components.RightWeld)
+						end
+
+						if components.CreatureRelease then
+							components.CreatureRelease:FireServer(components.RightWeld)
+						end
+					end
+				end
+			end
+
+			while RunService.Heartbeat:Wait() do
 				if flag11 then
 					for k in tbl16, nil, nil do
 						fn22(k)
@@ -34812,7 +36304,6 @@ Escape Timer: %*]]
 				if not tbl8.LoopApplyMethodT then
 					for k in tbl16, nil, nil do
 						fn22(k)
-						tbl16[k] = nil
 					end
 
 					if not tbl12.WaitForRuntimeToggle("LoopApplyMethodT") then
@@ -34824,10 +36315,9 @@ Escape Timer: %*]]
 				local selectedPlayers = tbl7.SelectedPlayers
 				local targetMethods = tbl7.TargetMethods
 
-				for k in tbl16, nil, nil do
+				for k, st in tbl16, nil, nil do
 					if k and (not k.Parent or not targetMethods.Kick or inPlot.Value or not loopApplyMethodT or not selectedPlayers[k]) then
 						fn22(k)
-						tbl16[k] = nil
 					end
 				end
 
@@ -34840,7 +36330,10 @@ Escape Timer: %*]]
 						for k in selectedPlayers, nil, nil do
 							if k and k.Parent and k:IsA("Player") then
 								table.insert(tbl17, k)
-								tbl16[k] = true
+
+								if not tbl16[k] then
+									tbl16[k] = { grabbedAt = os.clock() }
+								end
 							end
 						end
 
@@ -34853,6 +36346,7 @@ Escape Timer: %*]]
 									if not (v27 and v28 and torso and v28.Health > 0) then
 										fn22(v25)
 									else
+										local st = tbl16[v25]
 										local v29 = fn23(v23, i, #tbl17)
 										local kickAP = v27:FindFirstChild("KickAP")
 										local kickAO = v27:FindFirstChild("KickAO")
@@ -34869,12 +36363,17 @@ Escape Timer: %*]]
 
 											kickAP = Instance.new("BodyPosition")
 											local bodyGyro = Instance.new("BodyGyro")
-											kickAP.D = 200
+											-- a stronger hold than before (and still no ping cost - this is a local physics constraint,
+											-- not a remote): the damping ratio is kept (D scales with sqrt(P)) so it still doesn't ring,
+											-- it just resists a lot harder against someone trying to walk/jump out of it.
+											kickAP.P = 60000
+											kickAP.D = 500
 											kickAP.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
 											kickAP.Position = v29
 											kickAP.Parent = v27
+											bodyGyro.P = 15000
 											bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-											bodyGyro.D = 200
+											bodyGyro.D = 450
 											bodyGyro.CFrame = CFrame.new()
 											bodyGyro.Parent = v27
 											kickAP.Name = "KickAP"
@@ -34886,83 +36385,145 @@ Escape Timer: %*]]
 										end
 
 										kickAP.Position = v29
-										local flag12
+										local inRange = not (tbl12.GetMagnitude(v23, v27) > 33)
+										st.root2 = v27
+										local tag = tbl12.OwnerTag(v27)
+										local ours = tag == localPlayer.Name or tag == localPlayer
+										local resisted = tag ~= nil and tag ~= "" and tag ~= 0 and not ours
 
-										if not (tbl12.GetMagnitude(v23, v27) > 33) then
-											tbl12.Grab(v27)
-											flag12 = tbl9.NKDelayMode == "Faster but worse" or not tbl9.NKDelayMode
+										-- RESISTANCE: somebody else's tag is on him (his own anti-grab, or another player's line) - cut
+										-- it and re-claim in the same frame, instead of waiting for the next RNO cadence. Throttled (it
+										-- used to fire every single frame uncontested, which is its own ping spike while he resists) and
+										-- backed off further under the ping governor.
+										if resisted then
+											local resistGap = 0.03
+											local resistLv = tbl12.PingLevel()
 
-											if flag12 then
-												task.delay(0.2, tbl12.RNO, v27)
-											elseif tbl9.NKDelayMode == "Normal" then
-												task.spawn(function()
-													task.wait()
-													tbl12.RNO(v27)
+											if resistLv >= 2 then
+												resistGap = 0.08
+											elseif resistLv == 1 then
+												resistGap = 0.05
+											end
+
+											if os.clock() - (st.lastResist or 0) >= resistGap then
+												st.lastResist = os.clock()
+												pcall(function()
+													tbl11.DestroyGrabLine:FireServer(v27)
 												end)
+												tbl12.Grab(v27)
 											end
-
-											if tbl8.RagdollInNK then
-												task.spawn(tbl12.Ragdoll, v26)
-											end
-
-											if tbl8.DeleteShurInNK then
-												task.spawn(tbl12.RemoveSticky, v26)
-											end
-
-											tbl12.ToggleCollisions(v26, false)
-											tbl12.RepositionLimbs(v26, true)
-
-											task.delay(0.6, function()
-												if tbl8.LoopApplyMethodT and tbl7.TargetMethods.Kick and tbl7.SelectedPlayers[v25] and tbl12.IsNetworkOwner(v27) then
-													fn21(v27, v27)
-												end
-											end)
-										elseif tbl12.SNO(v27) then
-											tbl12.Teleport(v27, v29)
-											tbl12.Grab(v27)
-											flag12 = tbl9.NKDelayMode == "Faster but worse" or not tbl9.NKDelayMode
-
-											if flag12 then
-												task.delay(0.2, tbl12.RNO, v27)
-											elseif tbl9.NKDelayMode == "Normal" then
-												task.spawn(function()
-													task.wait()
-													tbl12.RNO(v27)
-												end)
-											end
-
-											if tbl8.RagdollInNK then
-												task.spawn(tbl12.Ragdoll, v26)
-											end
-
-											if tbl8.DeleteShurInNK then
-												task.spawn(tbl12.RemoveSticky, v26)
-											end
-
-											tbl12.ToggleCollisions(v26, false)
-											tbl12.RepositionLimbs(v26, true)
-
-											task.delay(0.6, function()
-												if tbl8.LoopApplyMethodT and tbl7.TargetMethods.Kick and tbl7.SelectedPlayers[v25] and tbl12.IsNetworkOwner(v27) then
-													fn21(v27, v27)
-												end
-											end)
-										else
-											fn21(v27, nil)
 										end
-									end
+
+										if inRange then
+											-- ALPHA BURST: the frame he first comes into grab range, claim him with 3 extra calls right
+											-- away instead of the single call/frame the loop settles into afterwards.
+											if not st.alphaFired then
+												st.alphaFired = true
+
+												for _ = 1, 3 do
+													tbl12.Grab(v27)
+												end
+											end
+
+											-- IMPROVE THE HOLD: tell the engine his own root is "asleep" network-wise while we hold him, so the
+											-- server stops re-syncing/correcting it off our own local BodyPosition/BodyGyro hold just because we're
+											-- moving around - this is also what stops HIS OWN client seeing his body desync/flail as we move, and
+											-- it's always released in fn22 the moment he's no longer tracked, so his PCLD never stays stuck.
+											if sethiddenproperty and not st.sleepSet then
+												st.sleepSet = pcall(sethiddenproperty, v27, "NetworkIsSleeping", true)
+											end
+
+											-- SETOWNER 1.2x FASTER THAN DESTROYLINE: both now fire on their own clock (not a single delayed RNO or an
+											-- every-frame Grab), with the destroyline interval always 1.2x the setowner interval, in real seconds so the
+											-- ratio holds regardless of fps. "Faster but worse" just uses a smaller base (more remotes/sec, same 1.2x
+											-- ratio); lower setowner rate by 0.0003s on both bases.
+											local nkBase = (tbl9.NKDelayMode == "Faster but worse") and 0.0079 or 0.0119
+											local nkPingLv = tbl12.PingLevel()
+
+											if nkPingLv >= 2 then
+												nkBase *= 2.2
+											elseif nkPingLv == 1 then
+												nkBase *= 1.4
+											end
+
+											local now2 = os.clock()
+
+											if now2 - (st.lastSet or 0) >= nkBase then
+												st.lastSet = now2
+												tbl12.Grab(v27)
+											end
+
+											-- hold a real window before releasing - releasing almost as fast as we claim just hands
+											-- ownership straight back and the BodyPosition/BodyGyro hold never gets a chance to apply
+											if now2 - (st.lastRel or 0) >= nkBase * 1.2 then
+												st.lastRel = now2
+												tbl12.RNO(v27)
+											end
+
+											if tbl8.RagdollInNK then
+												task.spawn(tbl12.Ragdoll, v26)
+											end
+
+											if tbl8.DeleteShurInNK then
+												task.spawn(tbl12.RemoveSticky, v26)
+											end
+
+											tbl12.ToggleCollisions(v26, false)
+											tbl12.RepositionLimbs(v26, true)
+										elseif tbl12.SNO(v27) then
+											st.alphaFired = false
+											tbl12.Teleport(v27, v29)
+											-- the weld/claim phase (far away, teleport + setowner): faster base than the in-range phase, since
+											-- this is purely about getting ownership established as quickly as possible; lower setowner rate by 0.0003s, same as above
+											local nkBase2 = (tbl9.NKDelayMode == "Faster but worse") and 0.0049 or 0.0079
+											local nkPingLv2 = tbl12.PingLevel()
+
+											if nkPingLv2 >= 2 then
+												nkBase2 *= 2.2
+											elseif nkPingLv2 == 1 then
+												nkBase2 *= 1.4
+											end
+
+											local now3 = os.clock()
+
+											if now3 - (st.lastSet or 0) >= nkBase2 then
+												st.lastSet = now3
+												tbl12.Grab(v27)
+											end
+
+											if now3 - (st.lastRel or 0) >= nkBase2 * 1.2 then
+												st.lastRel = now3
+												tbl12.RNO(v27)
+											end
+
+											if tbl8.RagdollInNK then
+												task.spawn(tbl12.Ragdoll, v26)
+											end
+
+											if tbl8.DeleteShurInNK then
+												task.spawn(tbl12.RemoveSticky, v26)
+											end
+
+											tbl12.ToggleCollisions(v26, false)
+											tbl12.RepositionLimbs(v26, true)
+										else
+											st.alphaFired = false
+										end
+
+										blobRemotes(st)
+										ekiFrame(st, v25, inRange)
+end
 								end
 							end
 
-							if tbl9.NKDelayMode == "Normal" then
-								task.wait()
+							if tbl9.NKDelayMode ~= "Faster but worse" then
+								RunService.Heartbeat:Wait()
 							end
 						end
 					end
 				end
 			end
 		end)
-
 		lib.ForceCheckbox = true
 
 		v19 = lib:CreateWindow({
@@ -35565,6 +37126,7 @@ Escape Timer: %*]]
 			})
 
 			Character:AddLabel("Only use this if you have >= 100FPS!", true)
+
 		end
 
 		do
@@ -35915,7 +37477,7 @@ Escape Timer: %*]]
 			Text = "Lag Strength",
 			Default = 11,
 			Min = 1,
-			Max = 11,
+			Max = 20,
 			Rounding = 0,
 			Compact = true,
 			Callback = function(lagLines)
@@ -36435,7 +37997,7 @@ Escape Timer: %*]]
 		Antis:AddToggle("AntiSnowball", {
 			Text = "Anti Snowball",
 			Default = false,
-			Tooltip = "Prevents you from getting snowballed",
+			Tooltip = "Rejects ALL ragdolls instantly (snowball or otherwise), not just the ones a snowball causes.",
 			Callback = function(arg)
 				tbl12.SetRuntimeToggle("AntiSnowball", arg)
 
@@ -36765,6 +38327,21 @@ Escape Timer: %*]]
 			end,
 		})
 
+		Miscellaneous:AddToggle("SeatlessBlob", {
+				Text = "Seatless Blob",
+				Default = false,
+				Tooltip = "Makes you able to use blobman loops, while not sitting on a blobman",
+			Callback = function(seatlessBlob)
+				tbl8.SeatlessBlob = seatlessBlob
+				tbl12.SeatlessBlob(seatlessBlob)
+			end,
+		})
+
+		-- red text without RichText markup (markup in a label can make the UI library's auto-size loop on some executors)
+		pcall(function()
+			toggles.SeatlessBlob.TextLabel.TextColor3 = Color3.fromRGB(255, 60, 60)
+		end)
+
 		local LastGrabbedLabel = Miscellaneous:AddLabel("LastGrabbedLabel", { Text = "Last person who grabbed you: nobody", DoesWrap = true })
 
 		tbl12.UpdateLastGrabbedLabel = function()
@@ -36819,6 +38396,226 @@ Escape Timer: %*]]
 	end
 
 	do
+				tbl7.ToyIcons = {
+			Airhorn = "rbxassetid://107579979248431",
+			AnvilGray = "rbxassetid://126466644775974",
+			ArmChairBlue = "rbxassetid://132068547498927",
+			ArmChairBrownGray = "rbxassetid://104883378402525",
+			ArmChairDarkGray = "rbxassetid://85878832247013",
+			ArmChairLightBrownGray = "rbxassetid://98931057214354",
+			ArmChairPink = "rbxassetid://129183068986607",
+			ArmChairPurple = "rbxassetid://82361898784282",
+			ArmChairWhite = "rbxassetid://129680683599606",
+			BallBasketball = "rbxassetid://124117930176682",
+			BallMagicLight = "rbxassetid://118605054936122",
+			BallSnowball = "rbxassetid://88449309231889",
+			BathroomShower = "rbxassetid://99048947822396",
+			BathroomSink = "rbxassetid://90378551072011",
+			BedBlanketBlue = "rbxassetid://105965229183457",
+			BedFramedOrange = "rbxassetid://86642865294127",
+			BedFuton = "rbxassetid://82726747221736",
+			BellBig = "rbxassetid://105393225121492",
+			BellSmall = "rbxassetid://124526896113322",
+			BombBalloon = "rbxassetid://134919370925649",
+			BombDarkMatter = "rbxassetid://122617660735564",
+			BombMissile = "rbxassetid://76009942745580",
+			BookManyPages = "rbxassetid://88673479799318",
+			BookNormal = "rbxassetid://127408946686031",
+			Boombox = "rbxassetid://137954485112699",
+			BoxCrateWood = "rbxassetid://80919346750587",
+			BubbleBlower = "rbxassetid://119762657659713",
+			BucketPaint = "rbxassetid://99180094284761",
+			Campfire = "rbxassetid://133169306444035",
+			ChildrensChair = "rbxassetid://112086542791929",
+			ChildrensCouch = "rbxassetid://86562881731848",
+			ChildrensDesk = "rbxassetid://82267390873028",
+			ChildrensShelf = "rbxassetid://75298500733717",
+			ChildrensTable = "rbxassetid://103654349875916",
+			ChildrensTableBench = "rbxassetid://101206925459182",
+			ChildrensTableBenchSmall = "rbxassetid://109290938646624",
+			ClockAlarm = "rbxassetid://129989066967727",
+			ComputerLaptopOld = "rbxassetid://72732912481320",
+			CouchBlue = "rbxassetid://79021413551851",
+			CouchBrownGray = "rbxassetid://129461342795588",
+			CouchDarkGray = "rbxassetid://106228830901883",
+			CouchLightBrownGray = "rbxassetid://70920500914668",
+			CouchPink = "rbxassetid://120044790273241",
+			CouchPurple = "rbxassetid://133595197657222",
+			CouchWhite = "rbxassetid://78431539132427",
+			CounterCorner = "rbxassetid://140416601120965",
+			CounterSink = "rbxassetid://107762891660094",
+			CounterStraight = "rbxassetid://78601936595261",
+			CreatureBlobman = "rbxassetid://121397196237272",
+			CreatureRobot = "rbxassetid://74168393624840",
+			CupMugBrown = "rbxassetid://74168393624840",
+			CupMugWhite = "rbxassetid://107681115846393",
+			DiceBig = "rbxassetid://122524903338859",
+			DiceSmall = "rbxassetid://113969514934389",
+			DiscoColorBall = "rbxassetid://107625757213769",
+			DrawerLightBrown = "rbxassetid://133462559021288",
+			FactoryBench = "rbxassetid://114546648751469",
+			FactoryCabinet = "rbxassetid://84163109626502",
+			FactoryChair = "rbxassetid://80435912874799",
+			FactoryCouch = "rbxassetid://122329739130188",
+			FactoryDesk = "rbxassetid://118554986948890",
+			FactoryDeskMini = "rbxassetid://119037441744393",
+			FactoryLight = "rbxassetid://125636200595264",
+			FactoryShelf = "rbxassetid://115820022943397",
+			FactoryTable = "rbxassetid://75876218906958",
+			FanElectricLittle = "rbxassetid://90108211677798",
+			FanPaper = "rbxassetid://116635727167719",
+			FireExtinguisher = "rbxassetid://91853839841308",
+			FireworkMissile = "rbxassetid://78849954002785",
+			FireworkSmokeBomb = "rbxassetid://124635072743198",
+			FireworkSparkler = "rbxassetid://83705111570739",
+			FlagUnitedStatesOfAmerica = "rbxassetid://93773469650577",
+			FloatingIsland = "rbxassetid://73033709284703",
+			FlyingToyHelicopter = "rbxassetid://95910938782572",
+			FlyingToyPlane = "rbxassetid://113523115553442",
+			FlyingToyUfo = "rbxassetid://112405200357665",
+			FoodBanana = "rbxassetid://75484207768793",
+			FoodBread = "rbxassetid://73483588123877",
+			FoodBroccoli = "rbxassetid://97340085804476",
+			FoodCakePink = "rbxassetid://135967824239828",
+			FoodCoconut = "rbxassetid://133875991045577",
+			FoodDippyEgg = "rbxassetid://89197648899618",
+			FoodDonut = "rbxassetid://121685717166327",
+			FoodFrenchFries = "rbxassetid://94745609579445",
+			FoodHamburger = "rbxassetid://107005089698340",
+			FoodHotdog = "rbxassetid://106249136532377",
+			FoodHotSauce = "rbxassetid://75701766244279",
+			FoodMayonnaise = "rbxassetid://87917161433070",
+			FoodMeatStick = "rbxassetid://119912069009462",
+			FoodMushroomPoison = "rbxassetid://103335679226894",
+			FoodPizzaCheese = "rbxassetid://106931956314027",
+			FoodPizzaPepperoni = "rbxassetid://94216796644855",
+			FoodPlate = "rbxassetid://112601173057362",
+			FoodSodaCan = "rbxassetid://85081927222669",
+			FridgeBlack = "rbxassetid://115916316353598",
+			FutureAngularDesk = "rbxassetid://127576064429423",
+			GlassBoxGray = "rbxassetid://136822712648110",
+			HayBale = "rbxassetid://102119975965945",
+			InstrumentBrassBugle = "rbxassetid://87157563194460",
+			InstrumentBrassTrumpet = "rbxassetid://96100498305663",
+			InstrumentBrassVuvuzela = "rbxassetid://80041454248720",
+			InstrumentDrumBongos = "rbxassetid://121844247397293",
+			InstrumentDrumSnare = "rbxassetid://106012654158373",
+			InstrumentGuitarAcoustic = "rbxassetid://134044426735217",
+			InstrumentGuitarBanjo = "rbxassetid://116000546776316",
+			InstrumentGuitarLyre = "rbxassetid://95132812667755",
+			InstrumentGuitarUkulele = "rbxassetid://95555859846275",
+			InstrumentGuitarViolin = "rbxassetid://136796330128678",
+			InstrumentPianoKeyboard = "rbxassetid://134663165959498",
+			InstrumentPianoMelodica = "rbxassetid://74776435919630",
+			InstrumentVoiceMicrophone = "rbxassetid://122274381498776",
+			InstrumentWoodwindOcarina = "rbxassetid://111465927393012",
+			InstrumentWoodwindSaxophone = "rbxassetid://123311585597786",
+			JapaneseBanner = "rbxassetid://112490664208321",
+			JapaneseBench = "rbxassetid://93980511357131",
+			JapaneseChair = "rbxassetid://118772129534166",
+			JapaneseCouch = "rbxassetid://97110405609081",
+			JapaneseDeskMini = "rbxassetid://130755724672620",
+			JapaneseDresser = "rbxassetid://95642439867934",
+			JapaneseLantern = "rbxassetid://139317721043641",
+			JapaneseShelf = "rbxassetid://99485597908677",
+			JapaneseTable = "rbxassetid://127026183321800",
+			JukeboxBlue = "rbxassetid://83713580031554",
+			JukeboxOrange = "rbxassetid://111545561584542",
+			LadderLightBrown = "rbxassetid://97966038347264",
+			LightLampDeskLampBent = "rbxassetid://89095666007492",
+			LightLampGray = "rbxassetid://130734630675109",
+			MachineWasher = "rbxassetid://75443435213432",
+			MidiMaker = "rbxassetid://108312376733697",
+			MineralCrystalPink = "rbxassetid://119522351784315",
+			MineralDiamond = "rbxassetid://136035935234483",
+			MineralIngotGold = "rbxassetid://110212740053497",
+			MusicKeyboard = "rbxassetid://72644194087868",
+			NinjaKatana = "rbxassetid://139546965155982",
+			NinjaKunai = "rbxassetid://85197427890853",
+			NinjaShuriken = "rbxassetid://140368128539182",
+			NormalBench = "rbxassetid://127591369190788",
+			NormalCabinet = "rbxassetid://83201670785579",
+			NormalDesk = "rbxassetid://71818176782652",
+			NormalShelves = "rbxassetid://75543861449843",
+			NpcRobloxianMascot = "rbxassetid://110620433205661",
+			OvenBlack = "rbxassetid://100502553897109",
+			OvenDarkGray = "rbxassetid://101075889339124",
+			OvenLightGray = "rbxassetid://83948935663997",
+			OvenMicrowaveWhite = "rbxassetid://129241869862582",
+			OvenRusty = "rbxassetid://129799764358427",
+			PalletLightBrown = "rbxassetid://72414557626355",
+			PaperPlane = "rbxassetid://113132762458773",
+			PetSnowman = "rbxassetid://92441134480732",
+			PetTurkeyLeg = "rbxassetid://74742499565747",
+			PlantPottedBonsai = "rbxassetid://96409932109342",
+			PlantPottedCactus = "rbxassetid://139149256399502",
+			PlantPottedTree = "rbxassetid://123304544863401",
+			PlantPottedTreeChristmas = "rbxassetid://133714107862983",
+			PlayhouseGingerbread = "rbxassetid://119555799677412",
+			PoopPile = "rbxassetid://102977099237461",
+			PoopPileSparkle = "rbxassetid://121252324664942",
+			PresentBig = "rbxassetid://113649348845297",
+			PresentSmall = "rbxassetid://78717962541786",
+			RedGateGong = "rbxassetid://127278016850181",
+			RollerGrayPurple = "rbxassetid://124245971218921",
+			SantaSleigh = "rbxassetid://128218651198278",
+			Snowflake = "rbxassetid://86518573014060",
+			SoundWaveMaker = "rbxassetid://83717378849854",
+			SpookyBench = "rbxassetid://95515331319063",
+			SpookyCabinet = "rbxassetid://121764055215413",
+			SpookyCandle1 = "rbxassetid://72509555120397",
+			SpookyCandle3 = "rbxassetid://127697547588069",
+			SpookyCandle5 = "rbxassetid://115309255630161",
+			SpookyChair = "rbxassetid://85941698596443",
+			SpookyCouch = "rbxassetid://71977056669359",
+			SpookyDesk = "rbxassetid://130272947276246",
+			SpookyShelf = "rbxassetid://119098894560334",
+			SpookyStool = "rbxassetid://111645873817619",
+			SpookyTable = "rbxassetid://104134073831489",
+			SpotlightBlue = "rbxassetid://120432870083468",
+			SpotlightCyan = "rbxassetid://130824785856256",
+			SpotlightCyanBlue = "rbxassetid://96181969763605",
+			SpotlightCyanGreen = "rbxassetid://126435494311992",
+			SpotlightGreen = "rbxassetid://98926417249470",
+			SpotlightMagenta = "rbxassetid://104278297471458",
+			SpotlightMagentaBlue = "rbxassetid://125389470560542",
+			SpotlightMagentaRed = "rbxassetid://137442512414512",
+			SpotlightRed = "rbxassetid://119078238555806",
+			SpotlightWhite = "rbxassetid://140618026054972",
+			SpotlightYellow = "rbxassetid://77480599416160",
+			SpotlightYellowGreen = "rbxassetid://129234357249175",
+			SpotlightYellowRed = "rbxassetid://90089125887705",
+			SprayCanWD = "rbxassetid://100485480124279",
+			TableLunchTable = "rbxassetid://78577643655620",
+			TableSmallLabTable = "rbxassetid://115195269005477",
+			TableWoodFourLegsBrown = "rbxassetid://84631203567137",
+			TableWoodTwoLegs = "rbxassetid://95944741470314",
+			TeapotUtah = "rbxassetid://78915783416124",
+			TelevisionFlatscreen = "rbxassetid://119838057624085",
+			TelevisionGray = "rbxassetid://74939784483601",
+			TetracubeI = "rbxassetid://134728416847817",
+			TetracubeJ = "rbxassetid://118842811235853",
+			TetracubeL = "rbxassetid://94959126008120",
+			TetracubeO = "rbxassetid://112107092004738",
+			TetracubeS = "rbxassetid://136248615920748",
+			TetracubeT = "rbxassetid://121206247295289",
+			TetracubeZ = "rbxassetid://120500759347878",
+			ToiletGold = "rbxassetid://124657722722417",
+			ToiletWhite = "rbxassetid://84274307077241",
+			ToolCleaver = "rbxassetid://70617572473301",
+			ToolDiggingForkRusty = "rbxassetid://99651991375781",
+			ToolPencil = "rbxassetid://92908917595707",
+			ToolPickaxe = "rbxassetid://129936050231156",
+			ToyAnimalBear = "rbxassetid://93745595874341",
+			ToyAnimalDuck = "rbxassetid://85905667915895",
+			ToyAnimalFrog = "rbxassetid://75996601096553",
+			ToyAnimalTiger = "rbxassetid://133587213766592",
+			ToyAnimalUnicorn = "rbxassetid://118351222526333",
+			TractorGreen = "rbxassetid://117546726657182",
+			TractorOrange = "rbxassetid://134396833776942",
+			TractorRed = "rbxassetid://79904842122527",
+		}
+
 		local Config = tbl15.Invincibility:AddRightGroupbox("Config", "settings")
 
 		Config:AddSlider("AntiLagSens", {
@@ -36832,20 +38629,17 @@ Escape Timer: %*]]
 			end,
 		})
 
-		Config:AddDivider("Auto Reset")
-
-		Config:AddToggle("AutoLeave", {
-			Text = "Auto Leave",
-			Default = true,
-			Tooltip = "Leaves after four detected kick flags instead of continuing to reset",
-			Callback = function(autoLeave)
-				tbl8.AutoLeave = autoLeave
-			end,
+		Config:AddDropdown("ConfigCategory", {
+			Values = { "Anti-Grab", "Anti Net-Owner", "Auto Reset" },
+			Default = "Anti-Grab",
+			Multi = false,
+			Text = "Category",
 		})
 
-		Config:AddDivider("Anti-Grabs")
+		local AGCat = Config:AddDependencyBox()
+		AGCat:SetupDependencies({ { options.ConfigCategory, "Anti-Grab" } })
 
-		Config:AddDropdown("AGTDropdown", {
+		AGCat:AddDropdown("AGTDropdown", {
 			Values = { "Normal", "No Ragdoll", "Anti-Kill", "Escapes Anything, but buggy" },
 			Default = 1,
 			Multi = false,
@@ -36856,11 +38650,27 @@ Escape Timer: %*]]
 			end,
 		})
 
-		Config:AddDropdown("GTDropdown", {
+		AGCat:AddToggle("AllowWhitelistedGrabs", {
+			Text = "Allow Whitelisted Grabs",
+			Default = false,
+			Tooltip = "Lets whitelisted players hold you. Only affects normal Anti-Grab.",
+			Callback = function(allowWhitelistedGrabs)
+				tbl8.AllowWhitelistedGrabs = allowWhitelistedGrabs
+			end,
+		})
+
+		AGCat:AddDivider("Gucci")
+
+		AGCat:AddDropdown("GTDropdown", {
 			Values = { "Blobman", "Tractor [Invisible]", "Train [Invisible]", "Sleigh [Invisible]" },
+			ValueImages = {
+				Blobman = tbl7.ToyIcons.CreatureBlobman,
+				["Tractor [Invisible]"] = tbl7.ToyIcons.TractorGreen,
+				["Sleigh [Invisible]"] = tbl7.ToyIcons.SantaSleigh,
+			},
 			Default = 1,
 			Multi = false,
-			Text = "GUCCI Type",
+			Text = "Vehicle",
 			Tooltip = "What vehicle will you sit on during Gucci Anti Grab",
 			Callback = function(arg)
 				if arg == "Blobman" then
@@ -36875,9 +38685,30 @@ Escape Timer: %*]]
 			end,
 		})
 
-		Config:AddDivider("Anti Net-Owner")
+		AGCat:AddToggle("AllowSitting", {
+			Text = "Allow Sitting",
+			Default = false,
+			Tooltip = "Lets you sit on vehicles normally; if you get up/jump off while [GUCCI] Anti Grab is on, it reacquires a fresh one for you right away instead of leaving you without one.",
+			Callback = function(allowSitting)
+				tbl8.AllowSitting = allowSitting
+			end,
+		})
 
-		Config:AddDropdown("AITDropdown", {
+		local ANOCat = Config:AddDependencyBox()
+		ANOCat:SetupDependencies({ { options.ConfigCategory, "Anti Net-Owner" } })
+
+		ANOCat:AddDropdown("AntiOwnerMethod", {
+			Values = { "Normal", "Silent", "Fast Grab & Drop" },
+			Default = "Normal",
+			Multi = false,
+			Text = "Method",
+			Tooltip = "Normal: the delay below, as set. Silent: only respawns the toy when it's actually gone (less visible toy churn). Fast Grab & Drop: ignores the delay and cycles as fast as possible.",
+			Callback = function(antiOwnerMethod)
+				tbl9.AntiOwnerMethod = antiOwnerMethod
+			end,
+		})
+
+		ANOCat:AddDropdown("AITDropdown", {
 			Values = {
 				"FoodHamburger",
 				"InstrumentDrumBongos",
@@ -36909,16 +38740,17 @@ Escape Timer: %*]]
 				"PoopPile",
 				"PoopPileSparkle",
 			},
+			ValueImages = tbl7.ToyIcons,
 			Default = 1,
 			Multi = false,
-			Text = "Type",
+			Text = "Toy",
 			Tooltip = "What interactable item will you use when doing anti-Net Owner",
 			Callback = function(antiInputType)
 				tbl9.AntiInputType = antiInputType
 			end,
 		})
 
-		Config:AddSlider("AntiInpLagDel", {
+		ANOCat:AddSlider("AntiInpLagDel", {
 			Text = "Grab & Drop Delay",
 			Default = 0.05,
 			Min = 0,
@@ -36930,9 +38762,7 @@ Escape Timer: %*]]
 			end,
 		})
 
-		Config:AddLabel("Below 0.05 can cause high ping")
-
-		Config:AddSlider("ItemTransAK", {
+		ANOCat:AddSlider("ItemTransAK", {
 			Text = "Item Transparency",
 			Default = tbl9.AILTransparency,
 			Min = 0,
@@ -36940,6 +38770,55 @@ Escape Timer: %*]]
 			Rounding = 2,
 			Callback = function(ailTransparency)
 				tbl9.AILTransparency = ailTransparency
+			end,
+		})
+
+		local AutoResetCat = Config:AddDependencyBox()
+		AutoResetCat:SetupDependencies({ { options.ConfigCategory, "Auto Reset" } })
+
+		AutoResetCat:AddToggle("AutoLeave", {
+			Text = "Auto Leave",
+			Default = true,
+			Tooltip = "Leaves the server once Flags Before Leaving is reached, instead of continuing to reset",
+			Callback = function(autoLeave)
+				tbl8.AutoLeave = autoLeave
+			end,
+		})
+
+		AutoResetCat:AddSlider("FlagsBeforeReset", {
+			Text = "Flags Before Reset",
+			Default = 1,
+			Min = 1,
+			Max = 4,
+			Rounding = 0,
+			Tooltip = "How many kick flags in the reset window before the character is reset (ChangeState Dead)",
+			Callback = function(flagsBeforeReset)
+				tbl9.FlagsBeforeReset = flagsBeforeReset
+			end,
+		})
+
+		AutoResetCat:AddSlider("FlagResetTimer", {
+			Text = "Flag Reset Timer",
+			Default = 1.2,
+			Min = 0.5,
+			Max = 3,
+			Suffix = " sec",
+			Rounding = 1,
+			Tooltip = "The window a kick flag counts within before the flag counter starts over at 1",
+			Callback = function(flagResetTimer)
+				tbl9.FlagResetTimer = flagResetTimer
+			end,
+		})
+
+		AutoResetCat:AddSlider("FlagsBeforeLeaving", {
+			Text = "Flags Before Leaving",
+			Default = 4,
+			Min = 1,
+			Max = 10,
+			Rounding = 0,
+			Tooltip = "Kick flags (within the reset window) before Auto Leave kicks you from the server yourself",
+			Callback = function(flagsBeforeLeaving)
+				tbl9.FlagsBeforeLeaving = flagsBeforeLeaving
 			end,
 		})
 
@@ -37022,9 +38901,9 @@ Escape Timer: %*]]
 	end
 
 	do
-		local v20 = tbl15.Target:AddRightGroupbox("Method Settings", "apple")
+		local MethodsBox = tbl15.Target:AddRightGroupbox("Methods", "list-checks")
 
-		v20:AddDropdown("MethodSettingsTargets", {
+		MethodsBox:AddDropdown("MethodSettingsTargets", {
 			Values = {
 				"Kick",
 				"Void",
@@ -37037,21 +38916,35 @@ Escape Timer: %*]]
 			},
 			Multi = true,
 			AllowNull = true,
-			Text = "Methods",
+			Text = "Active Methods",
 			Callback = function(targetMethods)
 				tbl7.TargetMethods = targetMethods
 			end,
 		})
+	end
+
+	do
+		-- "Settings For" picks WHICH active method's settings panel is shown below, separately from "Active Methods"
+		-- (so you can look at / tweak a method's settings without it being the one currently selected to run).
+		local v20 = tbl15.Target:AddRightGroupbox("Method Settings", "sliders-horizontal")
+
+		v20:AddDropdown("SettingsFor", {
+			Values = { "Kick", "Destroy Food", "Remove Gucci" }, -- only these three have a settings panel below
+			Multi = false,
+			AllowNull = true,
+			Default = "Kick",
+			Text = "Settings For",
+		})
 
 		local v21 = v20:AddDependencyBox()
-		v21:SetupDependencies({ { options.MethodSettingsTargets, "Kick" } })
+		v21:SetupDependencies({ { options.SettingsFor, "Kick" } })
 		v21:AddDivider("Kick Settings")
 
 		v21:AddDropdown("NKDelayConf", {
-			Values = { "Normal", "Faster but worse" },
-			Multi = false,
-			Default = 1,
-			Text = "Delay Mode",
+				Values = { "Normal", "Faster but worse", "Blob Remotes" },
+				Multi = false,
+				Default = 1,
+				Text = "Delay Mode",
 			Callback = function(nkDelayMode)
 				tbl9.NKDelayMode = nkDelayMode
 			end,
@@ -37064,6 +38957,7 @@ Escape Timer: %*]]
 				tbl8.RagdollInNK = ragdollInNK
 			end,
 		})
+
 
 		v21:AddToggle("AntiKickRemoverNK", {
 			Text = "Remove Anti-Kick",
@@ -37122,8 +39016,35 @@ Escape Timer: %*]]
 			end,
 		})
 
+		local v23 = v20:AddDependencyBox()
+		v23:SetupDependencies({ { options.SettingsFor, "Destroy Food" } })
+		v23:AddDivider("Destroy Food Settings")
+
+		v23:AddDropdown("DestroyFoodMethod", {
+			Values = { "Breaking", "Deletion" },
+			Default = "Deletion",
+			Multi = false,
+			Text = "Method",
+			Tooltip = "Breaking waits for him to actually let go (up to the timeout). Deletion forces it off him instantly.",
+			Callback = function(destroyFoodMethod)
+				tbl9.DestroyFoodMethod = destroyFoodMethod
+			end,
+		})
+
+		v23:AddSlider("DestroyFoodTimeout", {
+			Text = "Timeout",
+			Default = 1,
+			Min = 0.2,
+			Max = 3,
+			Suffix = " sec",
+			Rounding = 1,
+			Callback = function(destroyFoodTimeout)
+				tbl9.DestroyFoodTimeout = destroyFoodTimeout
+			end,
+		})
+
 		local v22 = v20:AddDependencyBox()
-		v22:SetupDependencies({ { options.MethodSettingsTargets, "Remove Gucci" } })
+		v22:SetupDependencies({ { options.SettingsFor, "Remove Gucci" } })
 		v22:AddDivider("Remove-Gucci Settings")
 
 		v22:AddToggle("RagdollInRG", {
@@ -37132,6 +39053,15 @@ Escape Timer: %*]]
 			Tooltip = "This takes 1.5 seconds, use only if you have time!",
 			Callback = function(ragdollInRG)
 				tbl8.RagdollInRG = ragdollInRG
+			end,
+		})
+
+		v22:AddToggle("PauseGucci", {
+			Text = "Pause Gucci",
+			Default = false,
+			Tooltip = "Lets Remove Gucci run even while you're riding your own [GUCCI] Anti Grab: hops off your own seat, removes theirs, then sits back on your own right after (you keep ownership of it the whole time).",
+			Callback = function(pauseGucci)
+				tbl8.PauseGucci = pauseGucci
 			end,
 		})
 
@@ -37487,6 +39417,7 @@ Escape Timer: %*]]
 
 		v21:AddDropdown("FlingMethod", {
 			Values = { "PalletLightBrown", "YouDecoy" },
+			ValueImages = tbl7.ToyIcons,
 			Default = "PalletLightBrown",
 			Multi = false,
 			Text = "Fling Method",
@@ -41147,6 +43078,10 @@ Escape Timer: %*]]
 			end
 		end)
 
+		tbl12.AddKeybind(Players2, "desyncpcld", "Desync PCLD", nil, "Press", function()
+			tbl12.DesyncPCLD()
+		end)
+
 		tbl12.AddKeybind(Players2, "bringplr", "Bring Player", nil, "Press", function()
 			local v20 = tbl12.GetTarget()
 			local playerFromCharacter = v20 and v20.Parent and Players:GetPlayerFromCharacter(v20.Parent)
@@ -42599,6 +44534,7 @@ Escape Timer: %*]]
 				tbl8.DirectGrab = directGrab
 			end,
 		})
+
 	end
 
 	do
